@@ -1,0 +1,57 @@
+"""
+配置模块测试
+"""
+import sys, os, importlib
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import unittest
+from unittest.mock import patch
+
+
+class TestSettingsEnv(unittest.TestCase):
+
+    def test_settings_reads_environment_overrides(self):
+        with patch.dict(os.environ, {
+            "QMT_PATH": r"D:\QMT\XtMiniQmt.exe",
+            "ACCOUNT_ID": "demo_account",
+            "ACCOUNT_PASSWORD": "demo_password",
+            "LOG_LEVEL": "DEBUG",
+            "LOG_SUMMARY_MODE": "true",
+            "POSITION_REPORT_TIMES": "09:40,11:40,15:10",
+            "WEB_PORT": "9000",
+            "ENABLE_REMOTE_DB": "true",
+            "REMOTE_DB_CONFIG": '{"host":"127.0.0.1","port":5432,"dbname":"cytrade2","user":"u","password":"p"}',
+        }, clear=False):
+            import config.settings as settings_module
+            settings_module = importlib.reload(settings_module)
+            settings = settings_module.Settings()
+
+            self.assertEqual(settings.QMT_PATH, r"D:\QMT\XtMiniQmt.exe")
+            self.assertEqual(settings.ACCOUNT_ID, "demo_account")
+            self.assertEqual(settings.ACCOUNT_PASSWORD, "demo_password")
+            self.assertEqual(settings.LOG_LEVEL, "DEBUG")
+            self.assertTrue(settings.LOG_SUMMARY_MODE)
+            self.assertEqual(settings.POSITION_REPORT_TIMES, ["09:40", "11:40", "15:10"])
+            self.assertEqual(settings.WEB_PORT, 9000)
+            self.assertTrue(settings.ENABLE_REMOTE_DB)
+            self.assertEqual(settings.REMOTE_DB_CONFIG["host"], "127.0.0.1")
+
+    def test_invalid_environment_values_fall_back_to_defaults(self):
+        with patch.dict(os.environ, {
+            "WEB_PORT": "not-int",
+            "CPU_ALERT_THRESHOLD": "not-float",
+            "LOG_SUMMARY_MODE": "not-bool",
+            "REMOTE_DB_CONFIG": "not-json",
+        }, clear=False):
+            import config.settings as settings_module
+            settings_module = importlib.reload(settings_module)
+            settings = settings_module.Settings()
+
+            self.assertEqual(settings.WEB_PORT, 8080)
+            self.assertEqual(settings.CPU_ALERT_THRESHOLD, 80.0)
+            self.assertFalse(settings.LOG_SUMMARY_MODE)
+            self.assertEqual(settings.REMOTE_DB_CONFIG["host"], "")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

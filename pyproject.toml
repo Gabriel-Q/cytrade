@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=69,<77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cytrade2"
+version = "0.1.0"
+description = "A QMT/xtquant-based Python quantitative trading framework with strategy runtime, order tracking, monitoring, and web control panel."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "CyTrade2 contributors" }
+]
+keywords = ["quant", "trading", "xtquant", "qmt", "fastapi"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Framework :: FastAPI",
+  "Intended Audience :: Developers",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Office/Business :: Financial :: Investment",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+  "xtquant",
+  "pandas>=2.0",
+  "numpy>=1.24",
+  "apscheduler>=3.10",
+  "fastapi>=0.100",
+  "uvicorn>=0.23",
+  "pydantic>=2.0",
+  "chinese-calendar>=1.9",
+  "psutil>=5.9",
+  "requests>=2.31",
+  "aiohttp>=3.8",
+  "websockets>=11.0",
+  "python-json-logger>=2.0",
+  "loguru>=0.7",
+  "psycopg2-binary>=2.9",
+]
+
+[project.scripts]
+cytrade2 = "main:run"
+
+[tool.setuptools]
+include-package-data = true
+py-modules = ["main", "date", "conftest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["config*", "core*", "data*", "monitor*", "position*", "strategy*", "trading*", "web*"]
+exclude = ["tests*"]
