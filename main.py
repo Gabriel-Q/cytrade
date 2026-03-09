@@ -1,5 +1,5 @@
 """
-CyTrade2 主程序入口
+cytrade 主程序入口
 启动顺序：
 1. 初始化日志 / 配置 / 数据库
 2. 连接 QMT
@@ -49,7 +49,7 @@ def build_app(strategy_classes=None, settings: Settings = None):
     )
     logger = get_logger("system")
     logger.info("=" * 50)
-    logger.info("CyTrade2 启动")
+    logger.info("cytrade 启动")
 
     # ---- 数据管理 ----
     data_mgr = DataManager(
@@ -215,9 +215,9 @@ def run(strategy_classes=None, settings: Settings = None):
     )
     data_thread.start()
 
-    logger.info("CyTrade2 运行中。按 Ctrl+C 退出。")
+    logger.info("cytrade 运行中。按 Ctrl+C 退出。")
     _stop_event.wait()
-    logger.info("CyTrade2 已退出")
+    logger.info("cytrade 已退出")
 
 
 if __name__ == "__main__":

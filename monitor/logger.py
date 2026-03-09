@@ -125,7 +125,7 @@ class LogManager:
     # ------------------------------------------------------------------
 
     def _create_logger(self, name: str) -> logging.Logger:
-        lgr = logging.getLogger(f"cytrade2.{name}")
+        lgr = logging.getLogger(f"cytrade.{name}")
         lgr.setLevel(getattr(logging, self._level, logging.INFO))
         lgr.propagate = False
 

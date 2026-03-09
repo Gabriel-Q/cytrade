@@ -1,6 +1,6 @@
-# CyTrade2
+# cytrade
 
-CyTrade2 是一个基于 [xtquant](https://dict.thinktrader.net/nativeApi/start_now.html) / QMT 的 Python 量化交易框架，覆盖以下完整链路：
+cytrade 是一个基于 [xtquant](https://dict.thinktrader.net/nativeApi/start_now.html) / QMT 的 Python 量化交易框架，覆盖以下完整链路：
 
 - 交易连接与自动重连
 - 实时行情订阅与分发
@@ -44,8 +44,9 @@ CyTrade2 是一个基于 [xtquant](https://dict.thinktrader.net/nativeApi/start_
 ## 项目结构
 
 ```text
-cytrade2/
+cytrade/
 ├── config/                  # 枚举、配置、费率表模板
+├── private/                 # 内部设计、审查、整改与人工审查文档
 ├── core/                    # QMT 回调、连接、订阅、历史数据
 ├── data/                    # SQLite / 状态文件 / 可选远程同步
 ├── monitor/                 # 日志、看门狗
@@ -55,10 +56,7 @@ cytrade2/
 ├── web/                     # FastAPI 后端 + Vue 前端
 ├── tests/                   # pytest 回归测试
 ├── main.py                  # 主入口
-├── requirements.txt
-├── 设计文档.md
-├── plan.md
-└── 终审.md
+└── requirements.txt
 ```
 
 ---
@@ -85,7 +83,7 @@ pip install -r requirements.txt
 如后续已发布到 PyPI，也可直接安装：
 
 ```bash
-pip install cytrade2
+pip install cytrade
 ```
 
 ### 2. 配置本地环境
@@ -103,7 +101,7 @@ pip install cytrade2
 | `ACCOUNT_ID` | 资金账号 | `your_account_id` |
 | `ACCOUNT_PASSWORD` | 登录密码 | `your_password` |
 | `SUBSCRIPTION_PERIOD` | 默认行情订阅周期 | `tick` / `1m` / `5m` |
-| `SQLITE_DB_PATH` | SQLite 路径 | `./data/db/cytrade2.db` |
+| `SQLITE_DB_PATH` | SQLite 路径 | `./data/db/cytrade.db` |
 | `STATE_SAVE_DIR` | 策略状态目录 | `./saved_states` |
 | `LOG_DIR` | 日志目录 | `./logs` |
 | `WEB_PORT` | Web 端口 | `8080` |
@@ -511,14 +509,11 @@ python -m twine upload dist/*
 
 ## 相关文档
 
-- `设计文档.md`：总体设计说明
-- `plan.md`：详细实施计划
-- `整改追踪表.md`：问题与整改跟踪
-- `终审.md`：终审结论与修复回写
 - `CONTRIBUTING.md`：贡献约定
 - `SECURITY.md`：安全说明
 - `RELEASE_CHECKLIST.md`：发布前检查清单
 - `CHANGELOG.md`：版本变更记录
+- `private/`：内部设计、审查与整改资料
 
 ---
 

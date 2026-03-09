@@ -1,13 +1,12 @@
 # Contributing
 
-欢迎对 CyTrade2 提交改进。
+欢迎对 cytrade 提交改进。
 
 ## 提交前建议
 
 1. 先阅读 [README.md](README.md)
-2. 先阅读 [设计文档.md](%E8%AE%BE%E8%AE%A1%E6%96%87%E6%A1%A3.md) 与 [plan.md](plan.md)
-3. 尽量保持变更聚焦，不做无关重构
-4. 不要提交真实账号、密码、令牌、Webhook 或本地路径
+2. 尽量保持变更聚焦，不做无关重构
+3. 不要提交真实账号、密码、令牌、Webhook 或本地路径
 
 ## 开发约定
 
@@ -23,7 +22,7 @@
 ## 本地验证
 
 ```bash
-+python -m pytest tests/ -v
+python -m pytest tests/ -v
 ```
 
 ## 变更建议范围

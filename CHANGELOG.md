@@ -36,7 +36,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 - Added open-source readiness files: `.gitignore`, `.env.example`, `CONTRIBUTING.md`, `SECURITY.md`, `RELEASE_CHECKLIST.md`.
 - Added regression tests for main app wiring, data subscription recovery, web cancel route, settings environment overrides, and `xt_order_id` persistence/migration.
-- Added `终审.md` as the final review summary.
+- Added `private/终审.md` as the final review summary.
 
 ### Changed
 - Improved `README.md` for public/open-source usage.

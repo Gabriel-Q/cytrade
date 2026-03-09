@@ -94,7 +94,7 @@ CREATE INDEX IF NOT EXISTS idx_orders_status       ON orders(status);
 class DataManager:
     """数据持久化管理（SQLite + pickle；可选 PostgreSQL）"""
 
-    def __init__(self, db_path: str = "./data/db/cytrade2.db",
+    def __init__(self, db_path: str = "./data/db/cytrade.db",
                  state_dir: str = "./saved_states",
                  remote_cfg: Optional[Dict] = None):
         self._db_path = db_path

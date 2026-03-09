@@ -106,7 +106,7 @@ class Settings:
     DEFAULT_STAMP_TAX_RATE: float = _env_float("DEFAULT_STAMP_TAX_RATE", 0.0003)
 
     # ---- 数据持久化 ----
-    SQLITE_DB_PATH: str = _env_str("SQLITE_DB_PATH", "./data/db/cytrade2.db")
+    SQLITE_DB_PATH: str = _env_str("SQLITE_DB_PATH", "./data/db/cytrade.db")
     STATE_SAVE_DIR: str = _env_str("STATE_SAVE_DIR", "./saved_states")
     ENABLE_REMOTE_DB: bool = _env_bool("ENABLE_REMOTE_DB", False)             # 是否同步远程数据库
     REMOTE_DB_CONFIG: dict = _env_json_dict("REMOTE_DB_CONFIG", {

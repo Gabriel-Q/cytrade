@@ -16,7 +16,7 @@ class TestMainBuildApp(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = Settings(
                 LOG_DIR=os.path.join(tmpdir, "logs"),
-                SQLITE_DB_PATH=os.path.join(tmpdir, "data", "cytrade2.db"),
+                SQLITE_DB_PATH=os.path.join(tmpdir, "data", "cytrade.db"),
                 STATE_SAVE_DIR=os.path.join(tmpdir, "saved_states"),
             )
             ctx = app_main.build_app(strategy_classes=[], settings=settings)

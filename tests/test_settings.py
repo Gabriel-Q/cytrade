@@ -26,7 +26,7 @@ class TestSettingsEnv(unittest.TestCase):
             "DEFAULT_BUY_FEE_RATE": "0.0002",
             "DEFAULT_SELL_FEE_RATE": "0.0003",
             "DEFAULT_STAMP_TAX_RATE": "0.0004",
-            "REMOTE_DB_CONFIG": '{"host":"127.0.0.1","port":5432,"dbname":"cytrade2","user":"u","password":"p"}',
+            "REMOTE_DB_CONFIG": '{"host":"127.0.0.1","port":5432,"dbname":"cytrade","user":"u","password":"p"}',
         }, clear=False):
             import config.settings as settings_module
             settings_module = importlib.reload(settings_module)

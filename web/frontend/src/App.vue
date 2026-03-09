@@ -2,7 +2,7 @@
   <el-container style="height:100vh">
     <el-aside width="200px" style="background:#001529">
       <div style="color:white;padding:20px;font-size:18px;font-weight:bold">
-        CyTrade2
+        cytrade
       </div>
       <el-menu :router="true" background-color="#001529" text-color="#fff"
                active-text-color="#1890ff" default-active="/">

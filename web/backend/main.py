@@ -73,7 +73,7 @@ def create_app():
         logger.info("FastAPI: 应用关闭")
 
     app = FastAPI(
-        title="CyTrade2 API",
+        title="cytrade API",
         description="量化交易框架控制面板",
         version="1.0.0",
         lifespan=lifespan,

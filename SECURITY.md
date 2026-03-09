@@ -2,7 +2,7 @@
 
 ## Supported Scope
 
-当前仅对 `cytrade2/` 目录下的代码与文档进行维护。
+当前仅对本仓库公开代码与文档进行维护。
 
 ## Sensitive Data Rules
 

@@ -1,1 +1,1 @@
-"""CyTrade2 web package."""
+"""cytrade web package."""
