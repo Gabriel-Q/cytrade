@@ -148,13 +148,18 @@ class TestOrderManager(unittest.TestCase):
 
     def test_on_trade_applies_fee_schedule(self):
         fee_schedule = MagicMock()
-        fee_schedule.calculate.return_value = SimpleNamespace(
-            buy_commission=1.0,
-            sell_commission=0.0,
-            stamp_tax=0.0,
-            total_fee=1.0,
-            is_t0=False,
-        )
+
+        def calc(_code, _direction, amount):
+            fee = 1.0 if float(amount) > 0 else 0.0
+            return SimpleNamespace(
+                buy_commission=fee,
+                sell_commission=0.0,
+                stamp_tax=0.0,
+                total_fee=fee,
+                is_t0=False,
+            )
+
+        fee_schedule.calculate.side_effect = calc
         order_mgr = OrderManager(data_manager=self.data_mgr, fee_schedule=fee_schedule)
         order = _mk_order(xt_order_id=5005)
         order_mgr.register_order(order)
@@ -174,6 +179,54 @@ class TestOrderManager(unittest.TestCase):
         self.assertEqual(trade.buy_commission, 1.0)
         self.assertEqual(trade.total_fee, 1.0)
         self.assertEqual(order_mgr.get_order(order.order_uuid).commission, 1.0)
+
+    def test_on_trade_recalculates_fee_by_cumulative_filled_amount(self):
+        fee_schedule = MagicMock()
+
+        def calc(_code, _direction, amount):
+            fee = round(float(amount) * 0.001, 2)
+            return SimpleNamespace(
+                buy_commission=fee,
+                sell_commission=0.0,
+                stamp_tax=0.0,
+                total_fee=fee,
+                is_t0=False,
+            )
+
+        fee_schedule.calculate.side_effect = calc
+        order_mgr = OrderManager(data_manager=self.data_mgr, fee_schedule=fee_schedule)
+        order = _mk_order(xt_order_id=6006)
+        order_mgr.register_order(order)
+
+        pos_cb = MagicMock()
+        order_mgr.set_position_callback(pos_cb)
+
+        order_mgr.on_trade(6006, {
+            "trade_id": "T6006-1",
+            "stock_code": "000001",
+            "direction": "BUY",
+            "price": 10.0,
+            "quantity": 100,
+            "amount": 1000.0,
+        })
+        first_trade = pos_cb.call_args.args[0]
+
+        order_mgr.on_trade(6006, {
+            "trade_id": "T6006-2",
+            "stock_code": "000001",
+            "direction": "BUY",
+            "price": 10.0,
+            "quantity": 100,
+            "amount": 500.0,
+        })
+        second_trade = pos_cb.call_args.args[0]
+        updated_order = order_mgr.get_order(order.order_uuid)
+
+        self.assertEqual(first_trade.total_fee, 1.0)
+        self.assertEqual(second_trade.total_fee, 0.5)
+        self.assertEqual(updated_order.filled_amount, 1500.0)
+        self.assertEqual(updated_order.total_fee, 1.5)
+        self.assertEqual(updated_order.buy_commission, 1.5)
 
 
 if __name__ == "__main__":

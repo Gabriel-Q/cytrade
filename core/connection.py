@@ -1,13 +1,14 @@
-"""
-交易连接管理模块
-- 管理与 QMT 客户端的 XtQuant 连接
-- 指数退避自动重连
-- 心跳保持
-- 提供 trader 实例供交易模块使用
+"""交易连接管理模块。
+
+本模块负责统一管理与 QMT/XtQuant 的连接生命周期，包括：
+- 初次连接与账户订阅
+- 断线后的指数退避重连
+- 心跳线程维护
+- 对外提供账户资产、持仓、委托等查询接口
 """
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from monitor.logger import get_logger
 
@@ -48,6 +49,21 @@ except ImportError:
             self._subscribed = True
             return 0
 
+        def query_stock_asset(self, account):
+            return None
+
+        def query_stock_positions(self, account):
+            return []
+
+        def query_stock_position(self, account, stock_code):
+            return None
+
+        def query_stock_orders(self, account, cancelable_only=False):
+            return []
+
+        def query_account_status(self):
+            return []
+
         def is_connected(self):
             return self._connected
 
@@ -69,22 +85,46 @@ class ConnectionManager:
     """
 
     def __init__(self, qmt_path: str, account_id: str,
+                 account_type: str = "STOCK",
                  base_interval: int = 1, max_interval: int = 60,
                  max_retries: Optional[int] = None):
+        """初始化连接管理器。
+
+        Args:
+            qmt_path: QMT 客户端路径或 userdata 路径。
+            account_id: 资金账号。
+            account_type: 账号类型，默认 `STOCK`。
+            base_interval: 重连基础等待秒数。
+            max_interval: 重连等待上限秒数。
+            max_retries: 最大重连次数，`None` 表示无限重试。
+        """
+        # ``qmt_path``：QMT 客户端 userdata 路径。
         self._qmt_path = qmt_path
+        # ``account_id``：资金账号。
         self._account_id = account_id
+        # ``account_type``：账号类型，默认股票账号 ``STOCK``。
+        self._account_type = str(account_type or "STOCK").upper()
         self._base_interval = base_interval
         self._max_interval = max_interval
         self._max_retries = max_retries
 
+        # ``_trader`` 是底层 XtQuantTrader 连接对象。
         self._trader: Optional[XtQuantTrader] = None
+        # ``_account`` 是已构造好的 xtquant 账户对象。
         self._account: Optional[StockAccount] = None
+        # ``_callback`` 保存当前注册的统一回调对象。
         self._callback = None
+        # ``_connected`` 是本地维护的连接状态兜底标记。
         self._connected = False
+        # ``_lock`` 保护连接、重连线程与状态切换。
         self._lock = threading.Lock()
+        # ``_heartbeat_thread`` 是心跳线程对象。
         self._heartbeat_thread: Optional[threading.Thread] = None
+        # ``_reconnect_thread`` 是异步重连线程对象。
         self._reconnect_thread: Optional[threading.Thread] = None
+        # ``_stop_heartbeat`` 用于通知心跳线程退出。
         self._stop_heartbeat = threading.Event()
+        # ``_reconnect_callbacks`` 保存重连成功后的补偿动作。
         self._reconnect_callbacks = []
 
         # 会话 ID：每次启动使用时间戳，避免冲突
@@ -110,7 +150,9 @@ class ConnectionManager:
                     except Exception:
                         pass
                 self._trader = XtQuantTrader(self._qmt_path, self._session_id)
-                self._account = StockAccount(self._account_id)
+                # 这里显式传入账号类型，既保留默认 ``STOCK`` 能力，
+                # 也允许未来切换到信用等其他账号类型。
+                self._account = StockAccount(self._account_id, self._account_type)
                 if self._callback:
                     # 回调必须在连接前注册，确保刚连接就能收到事件。
                     self._trader.register_callback(self._callback)
@@ -210,10 +252,85 @@ class ConnectionManager:
 
     @property
     def account(self) -> Optional[StockAccount]:
+        """返回当前已创建的交易账号对象。"""
         return self._account
 
+    @property
+    def account_type(self) -> str:
+        """返回当前连接管理器使用的账号类型字符串。"""
+        return self._account_type
+
+    def query_stock_asset(self):
+        """查询当前账户资产。
+
+        返回值通常是 ``XtAsset`` 对象；如果当前未连接或查询失败，则返回 ``None``。
+        """
+        trader = self.get_trader()
+        if not trader or not self._account:
+            logger.warning("ConnectionManager: 查询资产失败，交易连接尚未就绪")
+            return None
+        try:
+            return trader.query_stock_asset(self._account)
+        except Exception as exc:
+            logger.error("ConnectionManager: 查询账户资产异常: %s", exc, exc_info=True)
+            return None
+
+    def query_stock_positions(self) -> list[Any]:
+        """查询当前账户全部持仓。"""
+        trader = self.get_trader()
+        if not trader or not self._account:
+            logger.warning("ConnectionManager: 查询持仓失败，交易连接尚未就绪")
+            return []
+        try:
+            positions = trader.query_stock_positions(self._account)
+            return list(positions or [])
+        except Exception as exc:
+            logger.error("ConnectionManager: 查询全部持仓异常: %s", exc, exc_info=True)
+            return []
+
+    def query_stock_position(self, stock_code: str):
+        """查询某只证券的账户持仓。"""
+        trader = self.get_trader()
+        if not trader or not self._account:
+            logger.warning("ConnectionManager: 查询单只持仓失败，交易连接尚未就绪")
+            return None
+        try:
+            return trader.query_stock_position(self._account, self._to_xt_code(stock_code))
+        except Exception as exc:
+            logger.error("ConnectionManager: 查询持仓[%s]异常: %s", stock_code, exc, exc_info=True)
+            return None
+
+    def query_stock_orders(self, cancelable_only: bool = False) -> list[Any]:
+        """查询当前账户的当日委托列表。"""
+        trader = self.get_trader()
+        if not trader or not self._account:
+            logger.warning("ConnectionManager: 查询委托失败，交易连接尚未就绪")
+            return []
+        try:
+            orders = trader.query_stock_orders(self._account, cancelable_only=cancelable_only)
+            return list(orders or [])
+        except Exception as exc:
+            logger.error("ConnectionManager: 查询委托异常: %s", exc, exc_info=True)
+            return []
+
+    def query_account_status(self) -> list[Any]:
+        """查询账户状态列表。"""
+        trader = self.get_trader()
+        if not trader:
+            logger.warning("ConnectionManager: 查询账户状态失败，交易连接尚未就绪")
+            return []
+        try:
+            status_list = trader.query_account_status()
+            return list(status_list or [])
+        except Exception as exc:
+            logger.error("ConnectionManager: 查询账户状态异常: %s", exc, exc_info=True)
+            return []
+
     def on_disconnected(self) -> None:
-        """由回调层触发，启动异步重连线程。"""
+        """由回调层触发，启动异步重连线程。
+
+        这里专门做“防重复启动”保护，避免多次断线事件导致并发重连。
+        """
         logger.warning("ConnectionManager: 检测到连接断开，启动重连...")
         self._connected = False
         with self._lock:
@@ -251,6 +368,14 @@ class ConnectionManager:
                 logger.debug("ConnectionManager: 心跳 OK")
             except Exception as e:
                 logger.warning("ConnectionManager: 心跳异常: %s", e)
+
+    @staticmethod
+    def _to_xt_code(stock_code: str) -> str:
+        """把 6 位证券代码转换为 xtquant 使用的市场代码格式。"""
+        code = str(stock_code or "").strip().zfill(6)
+        if code.startswith(("6", "5")):
+            return f"{code}.SH"
+        return f"{code}.SZ"
 
 
 __all__ = ["ConnectionManager"]

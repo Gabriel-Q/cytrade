@@ -11,22 +11,25 @@ from typing import Optional
 
 @dataclass
 class TickData:
-    """预处理后的 Tick 行情数据（传给策略的标准格式）"""
-    stock_code: str = ""              # 6位数字代码
-    last_price: float = 0.0           # 最新价
-    open: float = 0.0
-    high: float = 0.0
-    low: float = 0.0
-    pre_close: float = 0.0            # 昨收价
-    volume: int = 0                   # 成交量（股）
-    amount: float = 0.0               # 成交额（元）
-    bid_prices: list = field(default_factory=list)    # 买一~买五价格
-    bid_volumes: list = field(default_factory=list)   # 买一~买五数量
-    ask_prices: list = field(default_factory=list)    # 卖一~卖五价格
-    ask_volumes: list = field(default_factory=list)   # 卖一~卖五数量
-    data_time: Optional[datetime] = None   # xtquant 推送的数据时间
-    recv_time: Optional[datetime] = None   # 本地接收时间
-    latency_ms: float = 0.0               # 延迟（毫秒）
+    """预处理后的 Tick 行情数据。
+
+    这是策略层唯一需要理解的行情结构。
+    """
+    stock_code: str = ""              # 证券代码，统一为 6 位数字格式。
+    last_price: float = 0.0           # 最新成交价。
+    open: float = 0.0                 # 当日开盘价。
+    high: float = 0.0                 # 当日最高价。
+    low: float = 0.0                  # 当日最低价。
+    pre_close: float = 0.0            # 昨日收盘价。
+    volume: int = 0                   # 成交量，单位为股。
+    amount: float = 0.0               # 成交额，单位为元。
+    bid_prices: list = field(default_factory=list)    # 买一到买五价格列表。
+    bid_volumes: list = field(default_factory=list)   # 买一到买五挂单量列表。
+    ask_prices: list = field(default_factory=list)    # 卖一到卖五价格列表。
+    ask_volumes: list = field(default_factory=list)   # 卖一到卖五挂单量列表。
+    data_time: Optional[datetime] = None   # 数据源原始时间戳。
+    recv_time: Optional[datetime] = None   # 本地接收该行情的时间。
+    latency_ms: float = 0.0               # 从数据源到本地的延迟毫秒数。
 
     @property
     def bid1(self) -> float:

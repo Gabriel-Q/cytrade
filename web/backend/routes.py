@@ -26,7 +26,8 @@ from web.backend.status_map import (
     order_type_text,
 )
 
-# 依赖由 main.py 注入
+# 这些全局变量由 `main.py` 在应用启动时注入。
+# 路由模块本身不负责实例化核心对象，只负责读取这些依赖并组织响应。
 _strategy_runner = None
 _position_manager = None
 _order_manager = None
@@ -47,11 +48,13 @@ if _FASTAPI and router is not None:
 
     @router.get("/strategies", response_model=List[StrategyInfo], tags=["策略"])
     async def get_strategies():
-        """获取所有策略列表"""
+        """返回当前全部策略列表。"""
         if not _strategy_runner:
             return []
         result = []
         for s in _strategy_runner.get_all_strategies():
+            # 这里把策略基本信息和当前持仓快照拼装到同一个响应对象里，
+            # 方便前端列表页一次性展示。
             pos = None
             if _position_manager:
                 pos = _position_manager.get_position(s.strategy_id)
@@ -115,7 +118,7 @@ if _FASTAPI and router is not None:
 
     @router.post("/strategies/{strategy_id}/close", response_model=ActionResponse, tags=["策略"])
     async def close_strategy(strategy_id: str):
-        """强制平仓"""
+        """对指定策略发出强制平仓指令。"""
         if not _strategy_runner:
             raise HTTPException(status_code=503, detail="StrategyRunner 未初始化")
         s = _strategy_runner.get_strategy(strategy_id)
@@ -171,28 +174,49 @@ if _FASTAPI and router is not None:
         """获取订单列表，可按策略过滤。"""
         if not _order_manager:
             return []
+        # 这里优先复用内存中的订单对象，
+        # 因为它比数据库更能体现“当前最新状态”。
         orders = (_order_manager.get_orders_by_strategy(strategy_id)
                   if strategy_id else list(_order_manager._orders.values()))
         result = []
         for o in orders:
             result.append(OrderInfo(
                 order_uuid=o.order_uuid,
+                xt_order_id=o.xt_order_id,
+                account_type=getattr(o, "account_type", 0),
+                account_id=getattr(o, "account_id", ""),
                 strategy_id=o.strategy_id,
                 strategy_name=o.strategy_name,
                 stock_code=o.stock_code,
+                xt_stock_code=getattr(o, "xt_stock_code", ""),
                 direction=o.direction.value,
                 direction_text=order_direction_text(o.direction.value),
                 order_type=o.order_type.value,
                 order_type_text=order_type_text(o.order_type.value),
+                xt_order_type=getattr(o, "xt_order_type", 0),
+                price_type=getattr(o, "price_type", 0),
                 price=o.price,
                 quantity=o.quantity,
                 status=o.status.value,
                 status_text=order_status_text(o.status.value),
+                xt_order_status=getattr(o, "xt_order_status", 0),
+                status_msg=getattr(o, "status_msg", ""),
+                order_sysid=getattr(o, "order_sysid", ""),
+                order_time=getattr(o, "order_time", 0),
+                xt_direction=getattr(o, "xt_direction", 0),
+                offset_flag=getattr(o, "offset_flag", 0),
+                secu_account=getattr(o, "secu_account", ""),
+                instrument_name=getattr(o, "instrument_name", ""),
                 filled_quantity=o.filled_quantity,
                 filled_avg_price=o.filled_avg_price,
                 filled_amount=o.filled_amount,
                 commission=o.commission,
+                buy_commission=getattr(o, "buy_commission", 0.0),
+                sell_commission=getattr(o, "sell_commission", 0.0),
+                stamp_tax=getattr(o, "stamp_tax", 0.0),
+                total_fee=getattr(o, "total_fee", o.commission),
                 remark=o.remark,
+                xt_fields=dict(getattr(o, "xt_fields", {}) or {}),
                 create_time=o.create_time.isoformat(),
                 update_time=o.update_time.isoformat(),
             ))
@@ -208,28 +232,48 @@ if _FASTAPI and router is not None:
             raise HTTPException(status_code=404, detail="订单不存在")
         return OrderInfo(
             order_uuid=o.order_uuid,
+            xt_order_id=o.xt_order_id,
+            account_type=getattr(o, "account_type", 0),
+            account_id=getattr(o, "account_id", ""),
             strategy_id=o.strategy_id,
             strategy_name=o.strategy_name,
             stock_code=o.stock_code,
+            xt_stock_code=getattr(o, "xt_stock_code", ""),
             direction=o.direction.value,
             direction_text=order_direction_text(o.direction.value),
             order_type=o.order_type.value,
             order_type_text=order_type_text(o.order_type.value),
+            xt_order_type=getattr(o, "xt_order_type", 0),
+            price_type=getattr(o, "price_type", 0),
             price=o.price,
             quantity=o.quantity,
             status=o.status.value,
             status_text=order_status_text(o.status.value),
+            xt_order_status=getattr(o, "xt_order_status", 0),
+            status_msg=getattr(o, "status_msg", ""),
+            order_sysid=getattr(o, "order_sysid", ""),
+            order_time=getattr(o, "order_time", 0),
+            xt_direction=getattr(o, "xt_direction", 0),
+            offset_flag=getattr(o, "offset_flag", 0),
+            secu_account=getattr(o, "secu_account", ""),
+            instrument_name=getattr(o, "instrument_name", ""),
             filled_quantity=o.filled_quantity,
             filled_avg_price=o.filled_avg_price,
             filled_amount=o.filled_amount,
             commission=o.commission,
+            buy_commission=getattr(o, "buy_commission", 0.0),
+            sell_commission=getattr(o, "sell_commission", 0.0),
+            stamp_tax=getattr(o, "stamp_tax", 0.0),
+            total_fee=getattr(o, "total_fee", o.commission),
             remark=o.remark,
+            xt_fields=dict(getattr(o, "xt_fields", {}) or {}),
             create_time=o.create_time.isoformat(),
             update_time=o.update_time.isoformat(),
         )
 
     @router.post("/orders/{order_uuid}/cancel", response_model=ActionResponse, tags=["订单"])
     async def cancel_order(order_uuid: str):
+        """提交指定订单的撤单请求。"""
         if not _order_manager or not _trade_executor:
             raise HTTPException(status_code=503, detail="OrderManager/TradeExecutor 未初始化")
         o = _order_manager.get_order(order_uuid)
@@ -301,6 +345,7 @@ if _FASTAPI and router is not None:
         active_orders = len(_order_manager.get_active_orders()) if _order_manager else 0
 
         try:
+            # `psutil` 是可选依赖，缺失时退回 0，避免影响核心接口可用性。
             import psutil
             cpu = psutil.cpu_percent(interval=0.1)
             mem = psutil.virtual_memory().percent
@@ -319,7 +364,7 @@ if _FASTAPI and router is not None:
 
     @router.get("/system/logs", tags=["系统"])
     async def get_logs(lines: int = Query(100)):
-        """读取最近 N 行系统日志"""
+        """读取最近 N 行系统日志。"""
         import os
         log_file = "./logs/system.log"
         if not os.path.exists(log_file):

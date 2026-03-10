@@ -28,6 +28,12 @@ class TestMainBuildApp(unittest.TestCase):
                 ctx["runner"]._heartbeat_callback.__func__,
                 ctx["watchdog"].register_heartbeat.__func__,
             )
+            self.assertIs(ctx["runner"]._alert_callback.__self__, ctx["watchdog"])
+            self.assertIs(
+                ctx["runner"]._alert_callback.__func__,
+                ctx["watchdog"].send_dingtalk_alert.__func__,
+            )
+            self.assertEqual(ctx["conn_mgr"].account_type, settings.ACCOUNT_TYPE)
 
 
 if __name__ == "__main__":

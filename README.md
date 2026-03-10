@@ -10,6 +10,8 @@ cytrade 是一个基于 [xtquant](https://dict.thinktrader.net/nativeApi/start_n
 - 手续费追踪与 T+0/T+1 可用仓位控制
 - Watchdog 监控告警
 - FastAPI + Vue Web 控制台
+- 一个策略对象维护一个标的，实现标的管理解耦。
+- 附加两个示例策略，帮助理解程序逻辑。
 
 当前仓库适合以下用途：
 
@@ -80,7 +82,7 @@ Python 依赖见 `requirements.txt`，前端依赖见 `web/frontend/package.json
 pip install -r requirements.txt
 ```
 
-如后续已发布到 PyPI，也可直接安装：
+已发布到 PyPI，也可直接安装（当前还未更新）：
 
 ```bash
 pip install cytrade
@@ -99,6 +101,7 @@ pip install cytrade
 |---|---|---|
 | `QMT_PATH` | QMT 客户端路径 | `D:\QMT\XtMiniQmt.exe` |
 | `ACCOUNT_ID` | 资金账号 | `your_account_id` |
+| `ACCOUNT_TYPE` | 账号类型，默认股票账号 | `STOCK` / `CREDIT` |
 | `ACCOUNT_PASSWORD` | 登录密码 | `your_password` |
 | `SUBSCRIPTION_PERIOD` | 默认行情订阅周期 | `tick` / `1m` / `5m` |
 | `SQLITE_DB_PATH` | SQLite 路径 | `./data/db/cytrade.db` |
@@ -146,7 +149,7 @@ pip install cytrade
 - 卖出手续费率：万 1
 - 印花税率：万 3
 
-所有费用均按成交金额计算，并向上取到分。
+所有费用均按成交金额计算，并向上取到分。所有费率默认免5规则。
 
 费用追踪生效后：
 
@@ -307,6 +310,190 @@ xtquant/QMT
   -> trading/executor.py
 ```
 
+### 回调函数信息汇总
+
+交易柜台推送进入框架后，主要由 [core/callback.py](core/callback.py) 统一接收，再分发给订单、持仓、策略与监控模块。
+
+| 回调函数 | 来源事件 | 主要用途 | 下游模块 |
+|---|---|---|---|
+| `on_connected()` | 交易连接建立 | 记录连接成功日志 | 监控/日志 |
+| `on_disconnected()` | 交易连接断开 | 触发重连 | [core/connection.py](core/connection.py) |
+| `on_stock_order()` | 订单状态变化 | 更新内部 `Order`、同步完整 XtOrder 信息 | [trading/order_manager.py](trading/order_manager.py) |
+| `on_stock_trade()` | 成交回报 | 生成 `TradeRecord`、更新订单累计成交与费用 | [trading/order_manager.py](trading/order_manager.py)、[position/manager.py](position/manager.py) |
+| `on_stock_asset()` | 账户资产回报 | 记录账户资产快照 | 日志/预检查 |
+| `on_stock_position()` | 持仓回报 | 记录账户真实持仓 | 日志/预检查 |
+| `on_order_stock_async_response()` | 异步下单返回 | 绑定本地订单 UUID 与 Xt 柜台单号 | [trading/order_manager.py](trading/order_manager.py) |
+| `on_cancel_order_stock_async_response()` | 异步撤单返回 | 标记撤单受理结果 | [trading/order_manager.py](trading/order_manager.py) |
+| `on_cancel_error()` | 撤单失败 | 记录失败原因 | 监控/日志 |
+| `on_order_error()` | 下单失败 | 标记订单失败状态 | [trading/order_manager.py](trading/order_manager.py) |
+
+### 回调函数关系图谱
+
+```mermaid
+flowchart LR
+    QMT[xtquant / QMT 回调] --> CB[core/callback.py]
+    CB --> CM[core/connection.py]
+    CB --> OM[trading/order_manager.py]
+    OM --> PM[position/manager.py]
+    OM --> SR[strategy/runner.py]
+    SR --> ST[strategy/base.py 子类]
+    CB --> LOG[monitor/logger.py]
+    SR --> WD[monitor/watchdog.py]
+```
+
+### 模块关系信息汇总
+
+下面这张表用于配合模块关系图阅读，帮助快速理解“谁负责什么、依赖谁、产出给谁”。
+
+| 模块 | 主要职责 | 关键输入 | 关键输出 | 主要依赖 |
+|---|---|---|---|---|
+| [config/](config/) | 提供运行参数、枚举、费率规则 | 环境变量、默认配置 | `Settings`、费率配置、枚举常量 | 无 |
+| [main.py](main.py) | 统一装配系统模块 | 配置、策略类列表 | 已连接的运行上下文 | config、core、trading、strategy、web、monitor |
+| [core/connection.py](core/connection.py) | 管理 QMT 连接、账户订阅、重连、账户查询 | QMT 路径、账号、回调对象 | trader/account 对象、连接状态、账户查询结果 | xtquant、config |
+| [core/callback.py](core/callback.py) | 接收 xtquant 回调并转成内部事件 | XtOrder、XtTrade、连接事件 | 订单更新、成交更新、重连触发 | connection、order_manager |
+| [core/data_subscription.py](core/data_subscription.py) | 行情订阅与重连后恢复订阅 | 证券代码、订阅周期 | Tick 数据回调 | xtdata、strategy_runner |
+| [core/history_data.py](core/history_data.py) | 历史数据下载与本地读取 | 证券列表、日期区间、周期 | DataFrame/历史行情数据 | xtdata |
+| [trading/executor.py](trading/executor.py) | 将策略信号翻译成真实下单/撤单请求 | 策略下单意图 | 内部 `Order`、柜台下单请求 | connection、order_manager、position_manager |
+| [trading/order_manager.py](trading/order_manager.py) | 维护订单生命周期、成交落地、费用汇总 | 订单回报、成交回报 | `Order`、`TradeRecord`、策略/持仓通知 | callback、data_manager、fee_schedule |
+| [position/manager.py](position/manager.py) | 根据真实成交维护持仓、成本、盈亏 | `TradeRecord`、行情价格 | `PositionInfo`、仓位汇总 | order_manager、fee_schedule |
+| [strategy/base.py](strategy/base.py) | 定义策略统一接口和通用风控 | Tick、配置、订单回报 | 交易信号、策略状态 | executor、position_manager |
+| [strategy/runner.py](strategy/runner.py) | 管理策略实例、选股、分发行情、状态恢复 | 策略类、Tick、账户状态 | 活跃策略集合、预检查告警 | base、data_subscription、data_manager、connection |
+| [data/manager.py](data/manager.py) | 持久化订单、成交、策略快照 | `Order`、`TradeRecord`、策略快照 | SQLite 数据、pickle 状态文件 | sqlite3 |
+| [monitor/watchdog.py](monitor/watchdog.py) | 监控心跳、连接、系统资源并发送钉钉告警 | 心跳、连接状态、系统资源 | 告警消息、状态检查结果 | connection、runner、position_manager |
+| [web/backend/](web/backend/) | 对外暴露 REST/WebSocket 控制接口 | 策略、订单、持仓、系统状态 | API 响应、WebSocket 推送 | runner、order_manager、position_manager |
+| [web/frontend/](web/frontend/) | 提供 Web 可视化界面 | 后端 API / WebSocket 数据 | 页面展示与交互操作 | web/backend |
+
+### 项目设计框架图
+
+这张图表达的是“系统分层”，不是单次交易流程。它强调本项目如何把配置层、接入层、领域层、应用层、展示层拆开。
+
+```mermaid
+flowchart TB
+    subgraph L1[配置与基础设施层]
+        CFG[config/settings.py<br/>config/enums.py<br/>config/fee_schedule.py]
+        DATASTORE[data/manager.py<br/>SQLite / pickle]
+        LOGSYS[monitor/logger.py<br/>monitor/watchdog.py]
+    end
+
+    subgraph L2[外部接入层]
+        QMT[xtquant / QMT]
+        XTMD[xtdata 行情/历史数据]
+    end
+
+    subgraph L3[接入适配层]
+        CONN[core/connection.py]
+        CALLBACK[core/callback.py]
+        SUB[core/data_subscription.py]
+        HIS[core/history_data.py]
+    end
+
+    subgraph L4[交易领域层]
+        EXEC[trading/executor.py]
+        ORDER[trading/order_manager.py]
+        POS[position/manager.py]
+        MODELS[trading/models.py<br/>position/models.py<br/>strategy/models.py]
+    end
+
+    subgraph L5[策略应用层]
+        RUNNER[strategy/runner.py]
+        BASE[strategy/base.py]
+        STRATS[示例/自定义策略<br/>TestGrid / CsvSignal]
+    end
+
+    subgraph L6[展示与控制层]
+        API[web/backend/*]
+        UI[web/frontend/*]
+    end
+
+    CFG --> CONN
+    CFG --> EXEC
+    CFG --> POS
+    CFG --> RUNNER
+    CFG --> API
+
+    QMT --> CONN
+    QMT --> CALLBACK
+    XTMD --> SUB
+    XTMD --> HIS
+
+    CONN --> EXEC
+    CONN --> RUNNER
+    CALLBACK --> ORDER
+    SUB --> RUNNER
+
+    EXEC --> ORDER
+    ORDER --> POS
+    ORDER --> DATASTORE
+    POS --> DATASTORE
+    RUNNER --> BASE
+    BASE --> STRATS
+    STRATS --> EXEC
+    STRATS --> POS
+    RUNNER --> DATASTORE
+    LOGSYS --> RUNNER
+    LOGSYS --> CONN
+
+    API --> RUNNER
+    API --> ORDER
+    API --> POS
+    API --> CONN
+    UI --> API
+
+    MODELS --> ORDER
+    MODELS --> POS
+    MODELS --> RUNNER
+```
+
+### 模块关系图
+
+```mermaid
+flowchart TD
+    CFG[config/* 配置] --> MAIN[main.py]
+    MAIN --> CONN[core/connection.py]
+    MAIN --> CALLBACK[core/callback.py]
+    MAIN --> DATA[data/manager.py]
+    MAIN --> RUNNER[strategy/runner.py]
+    MAIN --> WEB[web/backend/*]
+    CONN --> CALLBACK
+    CALLBACK --> ORDER[trading/order_manager.py]
+    ORDER --> POSITION[position/manager.py]
+    ORDER --> DATA
+    RUNNER --> STRATEGY[strategy/base.py / 示例策略]
+    RUNNER --> SUB[core/data_subscription.py]
+    RUNNER --> EXEC[trading/executor.py]
+    EXEC --> CONN
+    WEB --> ORDER
+    WEB --> POSITION
+    WEB --> RUNNER
+    WD[monitor/watchdog.py] --> MAIN
+    WD --> RUNNER
+```
+
+### 策略运行流程图
+
+```mermaid
+flowchart TD
+    A[程序启动] --> B[build_app 装配模块]
+    B --> C[连接 QMT 并注册回调]
+    C --> D[StrategyRunner.start]
+    D --> E{是否已有快照}
+    E -- 是 --> F[恢复策略状态]
+    E -- 否 --> G[执行选股]
+    F --> H[启动前账户资产/持仓校验]
+    G --> H
+    H --> I[订阅策略标的行情]
+    I --> J[收到 Tick]
+    J --> K[Strategy.process_tick]
+    K --> L{风控触发?}
+    L -- 是 --> M[止损/止盈平仓]
+    L -- 否 --> N[生成买卖信号]
+    N --> O[TradeExecutor 下单]
+    O --> P[xtquant 回调订单/成交]
+    P --> Q[OrderManager 更新订单与费用]
+    Q --> R[PositionManager 更新持仓]
+    Q --> S[StrategyRunner 分发订单更新]
+```
+
 ### 设计原则
 
 - 策略只产出信号，不直接操作底层接口
@@ -367,6 +554,36 @@ run(strategy_classes=[MyStrategy])
 
 参考实现：`strategy/test_grid_strategy.py`
 
+### CSV 示例策略
+
+项目还提供了一个更贴近实盘配置习惯的示例策略 [strategy/csv_signal_strategy.py](strategy/csv_signal_strategy.py)。
+
+它会读取 [config/example_strategy_signals.csv](config/example_strategy_signals.csv)，并把每一行都转换成一个独立策略实例。
+
+CSV 字段如下：
+
+| 字段 | 含义 |
+|---|---|
+| 股票代码 | 例如 `000001`、`600000.SH` |
+| 开仓价格 | 当前价小于等于该值时触发买入 |
+| 买入数量 | 计划买入股数 |
+| 止损位（百分比） | 例如 `3`、`3%`、`0.03` |
+| 止盈位（百分比） | 例如 `6`、`6%`、`0.06` |
+
+示例：
+
+```python
+from strategy.csv_signal_strategy import CsvSignalStrategy
+
+run(strategy_classes=[CsvSignalStrategy])
+```
+
+说明：
+
+- `CsvSignalStrategy` 会把止损/止盈百分比自动换算成价格。
+- 每个证券代码最终都会生成一个独立的 `StrategyConfig`。
+- 策略内部只负责“是否达到开仓价”，止损止盈继续复用 `BaseStrategy` 的通用风控链路。
+
 如需在策略或任务中判断交易日，可直接使用：
 
 ```python
@@ -423,7 +640,7 @@ if is_market_day("20260306"):
 
 ## 测试
 
-当前基线：`84 passed`
+当前回归测试请以本地 `pytest` 输出为准。
 
 ```bash
 python -m pytest tests/ -v
@@ -533,7 +750,10 @@ python -m twine upload dist/*
 ## License
 
 本项目采用 [MIT License](LICENSE)。
-2. **日期格式**：统一使用 `"YYYYMMDD"` 字符串（如 `"20260227"`）。
-3. **Mock 模式**：未连接 QMT 时，`TradeExecutor` 自动进入 Mock 模式，订单在内存中模拟成交，适用于策略逻辑调试。
-4. **跨交易日恢复**：每日 15:05 定时保存策略快照到 `saved_states/`；下次启动时自动加载当天状态文件。
-5. **最小下单单位**：`buy_by_amount` 按 100 股取整，不足 100 股时不下单。
+
+补充说明：
+
+1. **日期格式**：统一使用 `"YYYYMMDD"` 字符串（如 `"20260227"`）。
+2. **Mock 模式**：未连接 QMT 时，`TradeExecutor` 自动进入 Mock 模式，订单在内存中模拟成交，适用于策略逻辑调试。
+3. **跨交易日恢复**：每日 15:05 定时保存策略快照到 `saved_states/`；下次启动时自动加载当天状态文件。
+4. **最小下单单位**：`buy_by_amount` 按 100 股取整，不足 100 股时不下单。

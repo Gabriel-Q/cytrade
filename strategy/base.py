@@ -1,6 +1,12 @@
-"""
-策略基类
-所有具体策略继承此类，实现 on_tick() 和 select_stocks()
+"""策略基类模块。
+
+本模块定义所有策略必须遵循的统一接口与通用行为，包括：
+- 行情处理入口
+- 信号到交易动作的转换
+- 通用止损止盈检查
+- 订单跟踪与快照恢复
+
+这样不同策略只需要关注“何时买卖”，而不必重复实现公共骨架。
 """
 import uuid
 import threading
@@ -18,7 +24,7 @@ logger = get_logger("trade")
 
 
 class BaseStrategy(ABC):
-    """策略基类模板
+    """策略基类模板。
 
     类属性（所有策略实例共享）需在子类中定义：
         strategy_name: str      = "未命名策略"
@@ -46,14 +52,30 @@ class BaseStrategy(ABC):
 
     def __init__(self, config: StrategyConfig,
                  trade_executor=None, position_manager=None):
+        """初始化策略实例。
+
+        Args:
+            config: 当前策略实例的配置对象。
+            trade_executor: 交易执行器。
+            position_manager: 持仓管理器。
+        """
+        # ``strategy_id`` 是每个策略实例的唯一标识。
         self.strategy_id: str = str(uuid.uuid4())
+        # ``stock_code`` 表示当前策略实例唯一负责的标的代码。
         self.stock_code: str = config.stock_code
+        # ``status`` 记录策略当前运行状态，例如运行中、暂停、已停止。
         self.status: StrategyStatus = StrategyStatus.INITIALIZING
+        # ``config`` 保存该策略实例的全部配置参数。
         self.config: StrategyConfig = config
+        # ``_trade_executor`` 负责把策略信号变成下单请求。
         self._trade_executor = trade_executor
+        # ``_position_mgr`` 用于查询当前策略的持仓状态。
         self._position_mgr = position_manager
+        # ``_pending_orders`` 保存尚未终结的订单对象，便于防重复下单和状态跟踪。
         self._pending_orders: Dict[str, Order] = {}   # {order_uuid: Order}
+        # ``_create_time`` 记录该策略实例创建时间。
         self._create_time = datetime.now()
+        # ``_orders_history`` 保存该策略实例经历过的全部订单历史。
         self._orders_history: List[Order] = []
 
         logger.info("Strategy[%s] %s 初始化 stock=%s",
@@ -88,7 +110,11 @@ class BaseStrategy(ABC):
     # ------------------------------------------------------------------ 主处理流程
 
     def process_tick(self, tick: TickData) -> None:
-        """主处理流程（由 StrategyRunner 调用）"""
+        """处理一条最新行情。
+
+        Args:
+            tick: 当前标的的最新标准化行情对象。
+        """
         if self.status not in (StrategyStatus.RUNNING,):
             return
         if tick.stock_code != self.stock_code:
@@ -102,7 +128,8 @@ class BaseStrategy(ABC):
             if self._check_risk(tick):
                 return
 
-            # 生成信号
+            # 先由子类根据行情生成信号，
+            # 再统一走 `_execute_signal()` 转换成交易动作。
             signal = self.on_tick(tick)
 
             # 执行信号
@@ -115,7 +142,11 @@ class BaseStrategy(ABC):
             self.status = StrategyStatus.ERROR
 
     def _check_risk(self, tick: TickData) -> bool:
-        """风控检查，返回 True 表示已触发风控（处理结束）"""
+        """执行通用风控检查。
+
+        Returns:
+            若已触发止损或止盈并完成处理，则返回 `True`。
+        """
         if self.check_stop_loss(tick):
             logger.warning("Strategy[%s] 触发止损 price=%.3f stop=%.3f",
                            self.strategy_id[:8], tick.last_price,
@@ -156,11 +187,11 @@ class BaseStrategy(ABC):
     # ------------------------------------------------------------------ 仓位操作
 
     def add_position(self, price: float, quantity: int, remark: str = "") -> Optional[Order]:
-        """加仓（按数量），带最大持仓金额限制"""
+        """按股数加仓，并执行最大持仓金额限制检查。"""
         if not self._trade_executor:
             return None
             
-        # 仓位上限风控
+        # 这里的风控口径是“当前持仓市值 + 本次计划委托金额”。
         if self._position_mgr and self.config.max_position_amount > 0:
             pos = self._position_mgr.get_position(self.strategy_id)
             current_value = pos.market_value if pos else 0.0
@@ -186,7 +217,7 @@ class BaseStrategy(ABC):
 
     def add_position_by_amount(self, price: float, amount: float,
                                 remark: str = "") -> Optional[Order]:
-        """加仓（按金额），带最大持仓金额限制"""
+        """按金额加仓，并执行最大持仓金额限制检查。"""
         if not self._trade_executor:
             return None
             
@@ -210,7 +241,7 @@ class BaseStrategy(ABC):
 
     def reduce_position(self, price: float, quantity: int,
                         remark: str = "") -> Optional[Order]:
-        """减仓"""
+        """按指定价格和数量减仓。"""
         if not self._trade_executor:
             return None
         order = self._trade_executor.sell_limit(
@@ -221,7 +252,7 @@ class BaseStrategy(ABC):
         return order
 
     def close_position(self, remark: str = "") -> Optional[Order]:
-        """清仓（平仓），成功后策略置为 STOPPED"""
+        """提交清仓请求。"""
         if not self._trade_executor:
             return None
         order = self._trade_executor.close_position(
@@ -256,10 +287,12 @@ class BaseStrategy(ABC):
     # ------------------------------------------------------------------ 控制
 
     def start(self) -> None:
+        """把策略状态切换为运行中。"""
         self.status = StrategyStatus.RUNNING
         logger.info("Strategy[%s] %s 启动", self.strategy_id[:8], self.strategy_name)
 
     def pause(self) -> None:
+        """把策略状态切换为暂停。"""
         self.status = StrategyStatus.PAUSED
         logger.info("Strategy[%s] 暂停", self.strategy_id[:8])
 
@@ -276,18 +309,24 @@ class BaseStrategy(ABC):
     # ------------------------------------------------------------------ 订单回调
 
     def on_order_update(self, order: Order) -> None:
-        """订单状态更新回调（由 OrderManager 触发）"""
+        """处理订单状态更新回调。
+
+        Args:
+            order: 最新状态的订单对象。
+        """
         try:
             if order.strategy_id != self.strategy_id:
                 return
             from config.enums import OrderStatus, OrderDirection
+            # 订单进入终态后，从待处理列表中移除。
             if order.order_uuid in self._pending_orders:
                 if order.status in (OrderStatus.SUCCEEDED, OrderStatus.CANCELED,
                                     OrderStatus.PART_CANCEL, OrderStatus.JUNK,
                                     OrderStatus.UNKNOWN):
                     self._pending_orders.pop(order.order_uuid, None)
 
-            # 卖出全部成交后，若无仓位则自动停止策略
+                # 卖出订单全部成交后，如果该策略已经没有持仓，
+                # 则自动将策略标记为停止状态。
             if (order.direction == OrderDirection.SELL and
                     order.status == OrderStatus.SUCCEEDED and
                     self._position_mgr):
@@ -308,7 +347,7 @@ class BaseStrategy(ABC):
     # ------------------------------------------------------------------ 持久化
 
     def get_snapshot(self) -> StrategySnapshot:
-        """获取当前状态快照"""
+        """生成当前策略的可持久化快照。"""
         pos = None
         if self._position_mgr:
             pos = self._position_mgr.get_position(self.strategy_id)
@@ -327,13 +366,14 @@ class BaseStrategy(ABC):
         )
 
     def restore_from_snapshot(self, snapshot: StrategySnapshot) -> None:
-        """从快照恢复状态"""
+        """从历史快照恢复策略状态。"""
         self.strategy_id = snapshot.strategy_id
         self.stock_code = snapshot.stock_code
         self.status = snapshot.status
         self.config = snapshot.config
         
-        # 恢复持仓到持仓管理器
+        # 持仓恢复与策略对象恢复分开进行，
+        # 这样持仓管理器仍然是唯一的持仓状态维护中心。
         if self._position_mgr and snapshot.position:
             # 使用 restore_position 方法，内部自动处理加锁和 T+1 解锁
             self._position_mgr.restore_position(self.strategy_id, snapshot.position)
@@ -354,14 +394,18 @@ class BaseStrategy(ABC):
     # ------------------------------------------------------------------ Private
 
     def _track_order(self, order: Order) -> None:
-        """记录订单到待处理列表和历史列表。"""
+        """把订单记录到待处理列表和历史列表。"""
         if order and order.is_active():
             self._pending_orders[order.order_uuid] = order
         self._orders_history.append(order)
 
     @classmethod
     def _sync_class_stats(cls, position_manager=None) -> None:
-        """同步类级别统计信息（仓位数、已用金额）"""
+        """同步类级别统计信息。
+
+        这些统计量是“按策略类聚合”的，而不是按单个实例聚合，
+        便于子类实现全局仓位数和总资金占用约束。
+        """
         if not position_manager:
             return
         try:

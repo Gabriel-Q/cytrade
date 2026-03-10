@@ -113,6 +113,7 @@ class Settings:
     # ---- QMT 连接 ----
     QMT_PATH: str = _env_str("QMT_PATH", "")
     ACCOUNT_ID: str = _env_str("ACCOUNT_ID", "")
+    ACCOUNT_TYPE: str = _env_str("ACCOUNT_TYPE", "STOCK")
     ACCOUNT_PASSWORD: str = _env_str("ACCOUNT_PASSWORD", "")
 
     # ---- 数据订阅 ----

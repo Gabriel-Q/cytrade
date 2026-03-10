@@ -14,6 +14,7 @@ class _MockTrader:
     def __init__(self, path, session_id):
         self._connected = False
         self._subscribed = False
+        self._subscribed_account = None
 
     def start(self):
         pass
@@ -36,16 +37,28 @@ class _MockTrader:
 
     def subscribe(self, account):
         self._subscribed = True
+        self._subscribed_account = account
         return 0
+
+
+class _MockStockAccount:
+    """用于验证账号类型参数是否正确透传。"""
+
+    def __init__(self, account_id, account_type="STOCK"):
+        self.account_id = account_id
+        self.account_type = account_type
 
 
 class TestConnectionManager(unittest.TestCase):
 
     def setUp(self):
         # 强制使用 Mock Trader，不依赖真实 QMT 路径
-        patcher = patch("core.connection.XtQuantTrader", _MockTrader)
-        self.addCleanup(patcher.stop)
-        patcher.start()
+        trader_patcher = patch("core.connection.XtQuantTrader", _MockTrader)
+        account_patcher = patch("core.connection.StockAccount", _MockStockAccount)
+        self.addCleanup(trader_patcher.stop)
+        self.addCleanup(account_patcher.stop)
+        trader_patcher.start()
+        account_patcher.start()
         self.mgr = ConnectionManager(
             qmt_path=r"C:\mock\path.exe",
             account_id="test_account",
@@ -67,6 +80,17 @@ class TestConnectionManager(unittest.TestCase):
         self.mgr.connect()
         account = self.mgr.account
         self.assertIsNotNone(account)
+
+    def test_connect_uses_configured_account_type(self):
+        mgr = ConnectionManager(
+            qmt_path=r"C:\mock\path.exe",
+            account_id="test_account",
+            account_type="credit",
+        )
+
+        self.assertTrue(mgr.connect())
+        self.assertEqual(mgr.account.account_type, "CREDIT")
+        self.assertEqual(mgr.get_trader()._subscribed_account.account_type, "CREDIT")
 
     def test_disconnect(self):
         self.mgr.connect()

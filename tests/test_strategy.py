@@ -5,8 +5,10 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import unittest
+import tempfile
 from unittest.mock import MagicMock
 
+from strategy.csv_signal_strategy import CsvSignalStrategy
 from strategy.test_grid_strategy import TestGridStrategy
 from strategy.models import StrategyConfig
 from core.models import TickData
@@ -141,6 +143,65 @@ class TestGridStrategyUnit(unittest.TestCase):
         s2.restore_from_snapshot(snap)
         self.assertEqual(s2.strategy_id, s.strategy_id)
         self.assertTrue(s2._initialized)
+
+
+class TestCsvSignalStrategy(unittest.TestCase):
+
+    def test_select_stocks_loads_csv_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = os.path.join(tmpdir, "signals.csv")
+            with open(csv_path, "w", encoding="utf-8-sig") as fp:
+                fp.write("股票代码,开仓价格,买入数量,止损位（百分比）,止盈位（百分比）\n")
+                fp.write("000001,10.00,1000,3,6\n")
+                fp.write("600000.SH,8.50,2000,2.5%,5%\n")
+
+            strategy = CsvSignalStrategy(StrategyConfig(params={"csv_path": csv_path}))
+            configs = strategy.select_stocks()
+
+            self.assertEqual(len(configs), 2)
+            self.assertEqual(configs[0].stock_code, "000001")
+            self.assertEqual(configs[0].stop_loss_price, 9.7)
+            self.assertEqual(configs[0].take_profit_price, 10.6)
+            self.assertEqual(configs[1].stock_code, "600000")
+            self.assertEqual(configs[1].params["buy_quantity"], 2000)
+
+    def test_on_tick_returns_buy_signal_when_price_reaches_entry(self):
+        pos_mgr = MagicMock()
+        pos_mgr.get_position.return_value = None
+        strategy = CsvSignalStrategy(
+            StrategyConfig(
+                stock_code="000001",
+                entry_price=10.0,
+                params={"buy_quantity": 1200},
+            ),
+            trade_executor=MagicMock(),
+            position_manager=pos_mgr,
+        )
+        strategy.start()
+
+        signal = strategy.on_tick(_tick("000001", 9.98))
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal["action"], "BUY")
+        self.assertEqual(signal["quantity"], 1200)
+
+    def test_on_tick_skips_when_position_exists(self):
+        pos_mgr = MagicMock()
+        pos_mgr.get_position.return_value = MagicMock(total_quantity=100)
+        strategy = CsvSignalStrategy(
+            StrategyConfig(
+                stock_code="000001",
+                entry_price=10.0,
+                params={"buy_quantity": 1000},
+            ),
+            trade_executor=MagicMock(),
+            position_manager=pos_mgr,
+        )
+        strategy.start()
+
+        signal = strategy.on_tick(_tick("000001", 9.95))
+
+        self.assertIsNone(signal)
 
 
 if __name__ == "__main__":

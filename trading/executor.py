@@ -1,9 +1,7 @@
-"""
-交易执行模块
-- 封装多种下单方式：限价/市价/按金额/按数量/平仓/撤单
-- 每笔订单内部分配 UUID，同时追踪柜台订单号
-- 每笔订单必须有 remark
-- 下单后注册到 OrderManager
+"""交易执行模块。
+
+本模块的职责是把策略层发出的交易意图，转换为底层交易接口可执行的
+下单或撤单请求。它不维护最终成交结果，真正的订单状态仍以后续回调为准。
 """
 import math
 import time
@@ -41,16 +39,31 @@ class TradeExecutor:
 
     def __init__(self, connection_mgr, order_mgr: OrderManager,
                  position_mgr=None):
+        """初始化交易执行器。
+
+        Args:
+            connection_mgr: 交易连接管理器。
+            order_mgr: 订单管理器。
+            position_mgr: 可选的持仓管理器，用于平仓前查询可用仓位。
+        """
+        # ``_conn_mgr`` 提供 trader/account 等底层交易通道对象。
         self._conn_mgr = connection_mgr
+        # ``_order_mgr`` 负责注册订单并维护订单生命周期。
         self._order_mgr = order_mgr
+        # ``_position_mgr`` 主要用于平仓前查询可卖数量。
         self._position_mgr = position_mgr
+
+    @property
+    def connection_manager(self):
+        """返回当前执行器关联的连接管理器。"""
+        return self._conn_mgr
 
     # ------------------------------------------------------------------ 买入
 
     def buy_limit(self, strategy_id: str, strategy_name: str,
                   stock_code: str, price: float,
                   quantity: int, remark: str = "") -> Order:
-        """限价买入（挂单）"""
+        """提交限价买入订单。"""
         order = Order(
             strategy_id=strategy_id,
             strategy_name=strategy_name,
@@ -65,7 +78,7 @@ class TradeExecutor:
 
     def buy_market(self, strategy_id: str, strategy_name: str,
                    stock_code: str, quantity: int, remark: str = "") -> Order:
-        """市价买入（吃单）"""
+        """提交市价买入订单。"""
         order = Order(
             strategy_id=strategy_id,
             strategy_name=strategy_name,
@@ -81,7 +94,7 @@ class TradeExecutor:
     def buy_by_amount(self, strategy_id: str, strategy_name: str,
                       stock_code: str, price: float,
                       amount: float, remark: str = "") -> Order:
-        """按金额买入（自动计算数量，取整到100股）"""
+        """按金额换算股数后提交买入订单。"""
         if price <= 0:
             logger.error("buy_by_amount: price 必须 > 0")
             return self._failed_order(strategy_id, strategy_name, stock_code,
@@ -109,7 +122,7 @@ class TradeExecutor:
     def sell_limit(self, strategy_id: str, strategy_name: str,
                    stock_code: str, price: float,
                    quantity: int, remark: str = "") -> Order:
-        """限价卖出"""
+        """提交限价卖出订单。"""
         order = Order(
             strategy_id=strategy_id,
             strategy_name=strategy_name,
@@ -124,7 +137,7 @@ class TradeExecutor:
 
     def sell_market(self, strategy_id: str, strategy_name: str,
                     stock_code: str, quantity: int, remark: str = "") -> Order:
-        """市价卖出"""
+        """提交市价卖出订单。"""
         order = Order(
             strategy_id=strategy_id,
             strategy_name=strategy_name,
@@ -139,7 +152,7 @@ class TradeExecutor:
 
     def close_position(self, strategy_id: str, strategy_name: str,
                        stock_code: str, remark: str = "") -> Order:
-        """平仓（卖出全部可用持仓）"""
+        """卖出该策略当前全部可用持仓。"""
         available = 0
         if self._position_mgr:
             pos = self._position_mgr.get_position(strategy_id)
@@ -156,7 +169,11 @@ class TradeExecutor:
     # ------------------------------------------------------------------ 撤单
 
     def cancel_order(self, order_uuid: str, remark: str = "") -> bool:
-        """提交撤单请求，返回是否成功发出。"""
+        """提交撤单请求。
+
+        Returns:
+            是否成功把撤单请求发到底层接口。
+        """
         order = self._order_mgr.get_order(order_uuid)
         if not order:
             logger.warning("cancel_order: 未找到订单 uuid=%s", order_uuid[:8])
@@ -186,11 +203,17 @@ class TradeExecutor:
     # ------------------------------------------------------------------ Internal
 
     def _submit_order(self, order: Order) -> Order:
-        """提交订单到 xtquant，并同步注册到 ``OrderManager``。"""
+        """把内部订单提交到底层交易接口，并注册到订单管理器。
+
+        注意：
+        - 这里的“成功”只表示请求已发出。
+        - 最终是否成交、是否废单，要以后续回调结果为准。
+        """
         trader = self._conn_mgr.get_trader() if self._conn_mgr else None
 
         if not trader or not _XT_AVAILABLE:
-            # Mock 模式：直接标记为待报
+            # Mock 模式下没有真实柜台，因此直接生成一个伪订单号，
+            # 让后续策略链路依旧可以完整演练。
             order.xt_order_id = int(time.time() * 1000) % 2**31
             order.status = OrderStatus.WAIT_REPORTING
             self._order_mgr.register_order(order)

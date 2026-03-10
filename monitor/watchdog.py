@@ -1,11 +1,14 @@
-"""
-看门狗模块
-- 监控策略进程存活状态
-- 监控数据订阅超时
-- 监控交易连接状态
-- 系统资源（CPU / 内存）
-- 发送钉钉告警（告警分级）
-- 定时推送持仓报告
+"""系统健康检查与告警看门狗。
+
+该模块负责周期性执行多类运行时健康检查，包括：
+
+* 策略或核心模块心跳是否超时。
+* 行情订阅是否长时间未收到更新。
+* 交易连接是否断开。
+* 机器 CPU / 内存占用是否超过阈值。
+* 是否到达约定的持仓定时播报时间。
+
+当发现异常时，看门狗会统一通过日志和钉钉渠道发出分级告警。
 """
 import asyncio
 import hashlib
@@ -46,23 +49,36 @@ class Watchdog:
                  position_manager=None,
                  connection_manager=None,
                  data_subscription=None):
-        self._interval = interval_sec
-        self._webhook = dingtalk_webhook
-        self._secret = dingtalk_secret
-        self._cpu_threshold = cpu_threshold
-        self._mem_threshold = mem_threshold
-        self._report_times = set(position_report_times or ["09:35", "11:35", "15:05"])
-        self._position_mgr = position_manager
-        self._conn_mgr = connection_manager
-        self._data_sub = data_subscription
+        """初始化看门狗实例。
 
-        # 心跳表 {source: last_heartbeat_time}
+        Args:
+            interval_sec: 每轮检查之间的休眠秒数。
+            dingtalk_webhook: 钉钉机器人 Webhook 地址。
+            dingtalk_secret: 钉钉签名密钥；为空时不附加签名。
+            cpu_threshold: CPU 告警阈值百分比。
+            mem_threshold: 内存告警阈值百分比。
+            position_report_times: 需要自动发送持仓报告的时间点集合。
+            position_manager: 持仓管理器，用于生成持仓报告。
+            connection_manager: 连接管理器，用于检测交易连接状态。
+            data_subscription: 行情订阅管理对象，用于检查数据接收是否超时。
+        """
+        self._interval = interval_sec  # 后台巡检间隔。
+        self._webhook = dingtalk_webhook  # 钉钉机器人地址。
+        self._secret = dingtalk_secret  # 钉钉签名密钥。
+        self._cpu_threshold = cpu_threshold  # CPU 告警阈值。
+        self._mem_threshold = mem_threshold  # 内存告警阈值。
+        self._report_times = set(position_report_times or ["09:35", "11:35", "15:05"])  # 定时发送持仓报告的时点。
+        self._position_mgr = position_manager  # 持仓管理器引用。
+        self._conn_mgr = connection_manager  # 交易连接管理器引用。
+        self._data_sub = data_subscription  # 行情订阅对象引用。
+
+        # 心跳表用于记录各模块最近一次上报存活时间。
         self._heartbeats: Dict[str, float] = {}
-        self._heartbeat_timeout = 120   # 2分钟无心跳告警
+        self._heartbeat_timeout = 120   # 2 分钟无心跳则触发告警。
 
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._reported_times = set()    # 今日已推送过的时间点
+        self._running = False  # 后台线程运行标志。
+        self._thread: Optional[threading.Thread] = None  # 实际执行巡检的后台线程对象。
+        self._reported_times = set()    # 已发送过的“日期-时间点”键，防止重复推送。
 
     # ------------------------------------------------------------------ 控制
 
@@ -83,13 +99,21 @@ class Watchdog:
     # ------------------------------------------------------------------ 心跳
 
     def register_heartbeat(self, source: str) -> None:
-        """其他模块调用此方法表示自己存活"""
+        """记录某个模块的最新心跳时间。
+
+        Args:
+            source: 上报心跳的模块名称或来源标识。
+        """
         self._heartbeats[source] = time.time()
 
     # ------------------------------------------------------------------ 检查方法
 
     def check_strategy_alive(self) -> bool:
-        """检查策略心跳是否超时"""
+        """检查已注册模块的心跳是否超时。
+
+        Returns:
+            bool: 所有模块均在超时时间内返回 `True`，否则返回 `False`。
+        """
         now = time.time()
         for source, ts in list(self._heartbeats.items()):
             if now - ts > self._heartbeat_timeout:
@@ -101,7 +125,11 @@ class Watchdog:
         return True
 
     def check_data_subscription(self) -> bool:
-        """检查数据订阅是否超时"""
+        """检查行情订阅是否在交易时段内长时间无更新。
+
+        Returns:
+            bool: 数据接收正常或未启用行情订阅时返回 `True`，否则返回 `False`。
+        """
         if not self._data_sub:
             return True
         last = getattr(self._data_sub, "_last_recv_time", None)
@@ -117,7 +145,11 @@ class Watchdog:
         return True
 
     def check_connection(self) -> bool:
-        """检查交易连接状态"""
+        """检查交易连接当前是否仍然有效。
+
+        Returns:
+            bool: 已连接返回 `True`，断开时返回 `False` 并触发告警。
+        """
         if not self._conn_mgr:
             return True
         if not self._conn_mgr.is_connected():
@@ -129,7 +161,11 @@ class Watchdog:
         return True
 
     def check_system_resources(self) -> dict:
-        """检查 CPU 和内存占用情况。"""
+        """检查 CPU 和内存占用情况。
+
+        Returns:
+            dict: 包含 `cpu` 与 `memory` 百分比的字典；若未安装 `psutil` 则返回零值。
+        """
         result = {"cpu": 0.0, "memory": 0.0}
         if not _PSUTIL:
             return result
@@ -151,7 +187,7 @@ class Watchdog:
         return result
 
     def send_position_report(self) -> None:
-        """发送持仓汇总到钉钉"""
+        """将当前持仓汇总整理后发送到钉钉。"""
         if not self._position_mgr:
             return
         try:
@@ -169,7 +205,12 @@ class Watchdog:
             logger.error("Watchdog: 持仓报告发送失败: %s", e, exc_info=True)
 
     def send_dingtalk_alert(self, level: AlertLevel, message: str) -> None:
-        """发送钉钉告警消息"""
+        """发送分级钉钉告警消息。
+
+        Args:
+            level: 告警级别，会影响日志级别和展示前缀。
+            message: 需要发送的文本内容。
+        """
         if not self._webhook:
             logger.log(
                 40 if level == AlertLevel.ERROR else
@@ -198,9 +239,13 @@ class Watchdog:
     # ------------------------------------------------------------------ Private
 
     def _run_loop(self) -> None:
-        """看门狗主循环。"""
+        """后台巡检主循环。
+
+        该循环会串行执行各项检查逻辑，并在每轮结束后按配置的间隔休眠。
+        """
         while self._running:
             try:
+                # 按固定顺序执行检查，便于阅读日志时还原巡检过程。
                 self.check_strategy_alive()
                 self.check_data_subscription()
                 self.check_connection()
@@ -211,7 +256,10 @@ class Watchdog:
             time.sleep(self._interval)
 
     def _check_report_times(self) -> None:
-        """检查是否到了定时推送时间"""
+        """检查是否命中持仓定时播报时间点。
+
+        为避免同一分钟内多次循环重复发送，这里会使用“日期-时间点”组合键进行去重。
+        """
         now_str = datetime.now().strftime("%H:%M")
         key = f"{datetime.now().date()}-{now_str}"
         if now_str in self._report_times and key not in self._reported_times:
@@ -219,7 +267,11 @@ class Watchdog:
             self.send_position_report()
 
     def _signed_url(self) -> str:
-        """生成带签名的钉钉 Webhook URL"""
+        """生成带签名的钉钉 Webhook URL。
+
+        Returns:
+            str: 当配置了密钥时返回附加签名参数后的 URL，否则返回原始 Webhook。
+        """
         if not self._secret:
             return self._webhook
         ts = str(int(time.time() * 1000))
@@ -235,7 +287,11 @@ class Watchdog:
 
     @staticmethod
     def _is_trading_time() -> bool:
-        """粗略判断当前是否处于交易时段。"""
+        """粗略判断当前是否处于 A 股交易时段。
+
+        Returns:
+            bool: 当前时间位于设定的早盘或午盘区间时返回 `True`。
+        """
         t = datetime.now().strftime("%H:%M")
         return ("09:25" <= t <= "11:35") or ("12:55" <= t <= "15:05")
 

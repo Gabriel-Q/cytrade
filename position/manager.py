@@ -1,8 +1,10 @@
-"""
-持仓管理模块
-- 通过成交回调实时更新持仓（不直接调用）
-- 支持移动平均成本法 & FIFO
-- 内存字典维护，同时通知 DataManager 归档历史盈亏
+"""持仓管理模块。
+
+本模块专门负责“成交后持仓如何变化”，不负责下单。
+这样做的核心好处是：
+1. 持仓状态始终以真实成交为准，而不是以委托意图为准。
+2. 成本、可用数量、已实现盈亏都可以在同一处统一维护。
+3. 便于后续自动化文档工具直接提取持仓口径说明。
 """
 import threading
 from datetime import datetime
@@ -24,19 +26,41 @@ class PositionManager:
     """
 
     def __init__(self, cost_method: str = "moving_average", data_manager=None, fee_schedule=None):
+        """初始化持仓管理器。
+
+        Args:
+            cost_method: 成本计算方法，支持移动平均法或 FIFO。
+            data_manager: 可选的数据管理器，用于归档策略盈亏。
+            fee_schedule: 可选的费率表，用于判断证券是否为 T+0。
+        """
+        # ``_positions`` 以 ``strategy_id`` 为键保存实时持仓对象。
+        # 这里按“一个策略一个标的”的设计组织数据，
+        # 可以避免多策略共享同一只股票时互相覆盖状态。
         self._positions: Dict[str, PositionInfo] = {}   # {strategy_id: PositionInfo}
+        # ``_cost_method`` 决定卖出时采用移动平均还是 FIFO 口径。
         self._cost_method = CostMethod(cost_method)
+        # ``_data_mgr`` 用于在策略结束后持久化盈亏归档信息。
         self._data_mgr = data_manager
+        # ``_fee_schedule`` 主要用于判断证券是否支持 T+0。
         self._fee_schedule = fee_schedule
+        # ``_lock`` 保护多线程下的持仓字典与持仓对象更新。
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ 成交回调
 
     def on_trade_callback(self, trade: TradeRecord) -> None:
-        """由 OrderManager 触发；实时更新持仓"""
+        """处理成交回报并实时更新持仓。
+
+        这是持仓模块最核心的入口函数，通常由 `OrderManager` 在
+        收到真实成交回报后调用。
+
+        Args:
+            trade: 已标准化的成交记录对象。
+        """
         try:
             strategy_id = trade.strategy_id
             with self._lock:
+                # 第一次收到该策略的成交时，先创建一份空持仓骨架。
                 if strategy_id not in self._positions:
                     pos = PositionInfo(
                         strategy_id=strategy_id,
@@ -47,13 +71,19 @@ class PositionManager:
                     self._positions[strategy_id] = pos
                 else:
                     pos = self._positions[strategy_id]
+                    # 同一策略后续成交时，仍重新按最新规则刷新 T+0 属性，
+                    # 这样费率表调整后，恢复出来的旧状态也能被纠正。
                     pos.is_t0 = self._resolve_is_t0(pos.stock_code, trade)
 
+                # 买入和卖出会影响完全不同的字段，
+                # 因此拆成两个私有函数分别维护，便于阅读和测试。
                 if trade.direction == OrderDirection.BUY:
                     self._apply_buy(pos, trade)
                 else:
                     self._apply_sell(pos, trade)
 
+                # 成交费用统计统一在这里累计，
+                # 这样无论采用哪种成本法，费用口径都保持一致。
                 pos.total_buy_commission += float(getattr(trade, "buy_commission", 0.0) or 0.0)
                 pos.total_sell_commission += float(getattr(trade, "sell_commission", 0.0) or 0.0)
                 pos.total_stamp_tax += float(getattr(trade, "stamp_tax", 0.0) or 0.0)
@@ -72,7 +102,12 @@ class PositionManager:
             logger.error("PositionManager: on_trade_callback 异常: %s", e, exc_info=True)
 
     def update_price(self, stock_code: str, price: float) -> None:
-        """更新指定证券的最新价格，并重算浮动盈亏。"""
+        """更新指定证券的最新价格，并重算浮动盈亏。
+
+        Args:
+            stock_code: 6 位证券代码。
+            price: 最新成交价或最新行情价。
+        """
         with self._lock:
             for pos in self._positions.values():
                 if pos.stock_code == stock_code and pos.total_quantity > 0:
@@ -91,8 +126,14 @@ class PositionManager:
             return dict(self._positions)
 
     def get_position_summary(self) -> dict:
-        """持仓汇总统计"""
+        """返回全部持仓的汇总统计结果。
+
+        Returns:
+            一个普通字典，便于直接给 Web/API 层使用。
+        """
         with self._lock:
+            # 这里把所有聚合指标一次性算出，
+            # 避免上层重复遍历持仓字典。
             total_market = sum(p.market_value for p in self._positions.values())
             total_cost = sum(p.total_cost for p in self._positions.values())
             total_unrealized = sum(p.unrealized_pnl for p in self._positions.values())
@@ -116,7 +157,11 @@ class PositionManager:
             }
 
     def remove_position(self, strategy_id: str) -> None:
-        """策略清仓后归档盈亏，并移除内存持仓"""
+        """归档并移除指定策略的持仓。
+
+        Args:
+            strategy_id: 需要清理的策略 ID。
+        """
         with self._lock:
             pos = self._positions.pop(strategy_id, None)
         if pos and self._data_mgr:
@@ -134,8 +179,15 @@ class PositionManager:
                 logger.error("PositionManager: 盈亏归档失败: %s", e, exc_info=True)
 
     def restore_position(self, strategy_id: str, position: PositionInfo) -> None:
-        """恢复快照中的持仓（带锁保护）"""
+        """从快照中恢复单个策略持仓。
+
+        Args:
+            strategy_id: 策略 ID。
+            position: 从状态快照中读取出的持仓对象。
+        """
         with self._lock:
+            # 恢复时重新计算这些“可推导字段”，
+            # 避免旧快照中的冗余值与当前规则不一致。
             position.is_t0 = self._resolve_is_t0(position.stock_code, position)
             position.available_quantity = position.total_quantity
             position.total_commission = position.total_fees or position.total_commission
@@ -148,7 +200,12 @@ class PositionManager:
     # ------------------------------------------------------------------ PRIVATE
 
     def _apply_buy(self, pos: PositionInfo, trade: TradeRecord) -> None:
-        """处理买入成交对持仓的影响。"""
+        """把一笔买入成交应用到持仓对象上。
+
+        Args:
+            pos: 要更新的持仓对象。
+            trade: 买入方向的成交记录。
+        """
         qty = trade.quantity
         price = trade.price
         amount = trade.amount or (price * qty)
@@ -172,11 +229,17 @@ class PositionManager:
             pos.avg_cost = pos.total_cost / pos.total_quantity if pos.total_quantity > 0 else 0
 
     def _apply_sell(self, pos: PositionInfo, trade: TradeRecord) -> None:
-        """处理卖出成交对持仓的影响。"""
+        """把一笔卖出成交应用到持仓对象上。
+
+        Args:
+            pos: 要更新的持仓对象。
+            trade: 卖出方向的成交记录。
+        """
         qty = trade.quantity
         price = trade.price
         amount = trade.amount or (price * qty)
         total_fee = self._trade_total_fee(trade)
+        # 卖出时可真正落袋的是“成交金额减去卖出费用”。
         net_amount = amount - total_fee
 
         if self._cost_method == CostMethod.MOVING_AVERAGE:
@@ -212,10 +275,11 @@ class PositionManager:
             pos.avg_cost = pos.total_cost / pos.total_quantity if pos.total_quantity > 0 else 0
 
     def _trade_total_fee(self, trade: TradeRecord) -> float:
-        """获取一笔成交应计入持仓成本的总费用。"""
+        """返回一笔成交应计入持仓口径的总费用。"""
         total_fee = float(getattr(trade, "total_fee", 0.0) or 0.0)
         if total_fee > 0:
             return total_fee
+        # 兼容旧数据：如果还没有拆分费用字段，则退回旧的 commission 字段。
         return float(getattr(trade, "commission", 0.0) or 0.0)
 
     def _resolve_is_t0(self, stock_code: str, trade_or_position) -> bool:

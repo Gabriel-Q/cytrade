@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from config.enums import StrategyStatus
 from core.models import TickData
+from position.models import PositionInfo
 from strategy.base import BaseStrategy
 from strategy.models import StrategyConfig
 from strategy.runner import StrategyRunner
@@ -70,6 +71,49 @@ class TestStrategyRunner(unittest.TestCase):
         strategies = runner.get_all_strategies()
         self.assertEqual(len(strategies), 1)
         self.assertEqual(strategies[0].status, StrategyStatus.RUNNING)
+
+    def test_start_warns_when_strategy_limits_exceed_account_state(self):
+        data_sub = MagicMock()
+        position_mgr = MagicMock()
+        connection_mgr = MagicMock()
+        connection_mgr.is_connected.return_value = True
+        connection_mgr.query_stock_asset.return_value = MagicMock(cash=5_000.0, total_asset=20_000.0)
+        connection_mgr.query_stock_positions.return_value = [
+            MagicMock(stock_code="000001.SZ", volume=400, can_use_volume=300)
+        ]
+        position_mgr.get_all_positions.return_value = {
+            "s1": PositionInfo(
+                strategy_id="s1",
+                strategy_name="DummyStrategy",
+                stock_code="000001",
+                total_quantity=500,
+                available_quantity=350,
+            )
+        }
+
+        runner = StrategyRunner(
+            data_subscription=data_sub,
+            trade_executor=MagicMock(),
+            position_manager=position_mgr,
+            connection_manager=connection_mgr,
+            strategy_classes=[],
+        )
+        strategy = DummyStrategy(StrategyConfig(stock_code="000001", max_position_amount=8_000.0))
+        runner._strategies = [strategy]
+        runner._load_state = MagicMock(return_value=True)
+        runner.run_stock_selection = MagicMock()
+        runner._start_scheduler = MagicMock()
+        alert_callback = MagicMock()
+        runner.set_alert_callback(alert_callback)
+
+        with patch.object(runner, "is_trading_day", return_value=True):
+            runner.start()
+
+        self.assertGreaterEqual(alert_callback.call_count, 3)
+        messages = [call.args[1] for call in alert_callback.call_args_list]
+        self.assertTrue(any("最大资金" in message for message in messages))
+        self.assertTrue(any("超过账户实际持仓" in message for message in messages))
+        self.assertTrue(any("超过账户实际可用持仓" in message for message in messages))
 
 
 if __name__ == "__main__":

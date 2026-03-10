@@ -1,13 +1,14 @@
-"""
-订单管理模块
-- 追踪每笔订单的全生命周期
-- 接收成交回报并通知持仓/策略模块（事件回调）
-- 持久化到 SQLite（通过 DataManager）
+"""订单管理模块。
+
+这个模块负责维护订单从“创建”到“完成/撤销/废单”的完整生命周期。
+它同时也是成交分发中心，负责把成交回报同步给持仓模块、策略模块、
+以及可选的 WebSocket 推送模块。
 """
 import threading
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
+from config.fee_schedule import FeeBreakdown
 from trading.models import Order, TradeRecord
 from config.enums import OrderStatus, OrderDirection
 from monitor.logger import get_logger
@@ -25,20 +26,39 @@ class OrderManager:
     """
 
     def __init__(self, data_manager=None, fee_schedule=None):
+        """初始化订单管理器。
+
+        Args:
+            data_manager: 可选的数据管理器，用于持久化订单与成交。
+            fee_schedule: 可选的费率表，用于按累计成交额重算费用。
+        """
+        # ``_data_mgr`` 负责把订单/成交同步到 SQLite。
         self._data_mgr = data_manager
+        # ``_fee_schedule`` 负责计算手续费和印花税拆分。
         self._fee_schedule = fee_schedule
+        # ``_orders`` 保存全部内部订单对象，键为内部 UUID。
         self._orders: Dict[str, Order] = {}                  # {order_uuid: Order}
+        # ``_xt_to_uuid`` 用于把柜台订单号反查回内部订单 UUID。
         self._xt_to_uuid: Dict[int, str] = {}               # {xt_order_id: order_uuid}
-        self._seq_to_uuid: Dict[int, str] = {}              # {async_seq: order_uuid} 临时映射
+        # ``_seq_to_uuid`` 用于异步下单时，先用 seq 暂存本地订单映射。
+        self._seq_to_uuid: Dict[int, str] = {}              # {async_seq: order_uuid}
+        # ``_position_callback`` 在成交后通知持仓模块更新仓位。
         self._position_callback: Optional[Callable[[TradeRecord], None]] = None
+        # ``_strategy_callback`` 在订单状态变化后通知策略对象。
         self._strategy_callback: Optional[Callable[[Order], None]] = None
+        # ``_trade_callback`` 在成交后通知其他订阅方，例如 WebSocket。
         self._trade_callback: Optional[Callable[[TradeRecord], None]] = None
+        # ``_lock`` 保护订单字典和映射字典在多线程环境下的一致性。
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ 注册
 
     def register_order(self, order: Order) -> None:
-        """注册新订单"""
+        """注册新订单到内存和持久化层。
+
+        Args:
+            order: 新创建的内部订单对象。
+        """
         with self._lock:
             self._orders[order.order_uuid] = order
             if order.xt_order_id:
@@ -57,8 +77,17 @@ class OrderManager:
 
     def update_order_status(self, xt_order_id: int, status: OrderStatus,
                              filled_qty: int = 0, filled_amount: float = 0,
-                             avg_price: float = 0) -> None:
-        """更新订单状态（通常由回调层调用）。"""
+                             avg_price: float = 0, order_info: Optional[dict] = None) -> None:
+        """根据回调结果更新订单状态。
+
+        Args:
+            xt_order_id: 柜台订单号。
+            status: 内部统一订单状态。
+            filled_qty: 最新已成交数量。
+            filled_amount: 最新已成交金额。
+            avg_price: 最新成交均价。
+            order_info: 可选的完整 XtOrder 字段快照。
+        """
         with self._lock:
             uuid = self._xt_to_uuid.get(xt_order_id)
             if not uuid:
@@ -66,13 +95,23 @@ class OrderManager:
             order = self._orders.get(uuid)
             if not order:
                 return
+
+            if order_info:
+                # 如果这次回调携带了完整 XtOrder 信息，
+                # 先把原始字段同步到内部订单对象，方便后续展示和排障。
+                self._apply_xt_order_fields(order, order_info)
+
             order.status = status
-            if filled_qty:
-                order.filled_quantity = filled_qty
-            if filled_amount:
-                order.filled_amount = filled_amount
-            if avg_price:
-                order.filled_avg_price = avg_price
+            if filled_qty or (order_info and "traded_volume" in order_info):
+                order.filled_quantity = int(filled_qty or order_info.get("traded_volume", 0) or 0)
+            if filled_amount or (order_info and ("traded_amount" in order_info or "traded_price" in order_info)):
+                order.filled_amount = self._resolve_filled_amount(order, filled_amount, order_info)
+            if avg_price or (order_info and "traded_price" in order_info):
+                order.filled_avg_price = float(avg_price or order_info.get("traded_price", 0.0) or 0.0)
+
+            # 订单状态更新时也同步重算“整张订单”的累计费用，
+            # 保证订单页看到的费用始终与当前累计成交额一致。
+            self._recalculate_order_fee(order)
             order.update_time = datetime.now()
 
         if self._data_mgr:
@@ -141,6 +180,9 @@ class OrderManager:
                 quantity=int(trade_info.get("traded_volume", trade_info.get("quantity", 0)) or 0),
                 amount=float(trade_info.get("traded_amount", trade_info.get("amount", 0)) or 0),
                 commission=float(trade_info.get("commission", 0)),
+                secu_account=str(trade_info.get("secu_account", "") or ""),
+                instrument_name=str(trade_info.get("instrument_name", "") or ""),
+                xt_fields=dict(trade_info.get("xt_fields", {}) or {}),
                 trade_time=traded_at,
             )
             self._apply_fee_breakdown(trade)
@@ -148,15 +190,23 @@ class OrderManager:
             # 更新订单已成交量
             if order:
                 with self._lock:
+                    previous_fee = self._calculate_fee(order.stock_code, direction, order.filled_amount)
                     order.filled_quantity += trade.quantity
                     order.filled_amount += trade.amount
-                    order.commission += trade.total_fee
                     if order.filled_quantity > 0:
                         order.filled_avg_price = order.filled_amount / order.filled_quantity
                     if order.filled_quantity >= order.quantity:
                         order.status = OrderStatus.SUCCEEDED
                     else:
                         order.status = OrderStatus.PART_SUCC
+                    self._recalculate_order_fee(order)
+                    delta_fee = self._diff_fee(self._calculate_fee(order.stock_code, direction, order.filled_amount), previous_fee)
+                    trade.buy_commission = delta_fee.buy_commission
+                    trade.sell_commission = delta_fee.sell_commission
+                    trade.stamp_tax = delta_fee.stamp_tax
+                    trade.total_fee = delta_fee.total_fee
+                    trade.is_t0 = delta_fee.is_t0
+                    trade.commission = delta_fee.total_fee
                     order.update_time = datetime.now()
 
             # 持久化成交
@@ -220,6 +270,7 @@ class OrderManager:
 
     @staticmethod
     def _to_int(value, default: int = 0) -> int:
+        """把输入安全转换为整数，失败时返回默认值。"""
         try:
             return int(value or 0)
         except (TypeError, ValueError):
@@ -227,6 +278,7 @@ class OrderManager:
 
     @staticmethod
     def _parse_xt_traded_time(xt_traded_time: int) -> datetime:
+        """把 XtTrade 的时间整数字段转换为 `datetime` 对象。"""
         if xt_traded_time <= 0:
             return datetime.now()
         text = str(xt_traded_time)
@@ -243,7 +295,7 @@ class OrderManager:
             trade.amount = trade.price * trade.quantity
 
         if self._fee_schedule:
-            fee = self._fee_schedule.calculate(trade.stock_code, trade.direction, trade.amount)
+            fee = self._calculate_fee(trade.stock_code, trade.direction, trade.amount)
             trade.buy_commission = fee.buy_commission
             trade.sell_commission = fee.sell_commission
             trade.stamp_tax = fee.stamp_tax
@@ -258,8 +310,91 @@ class OrderManager:
         else:
             trade.sell_commission = trade.total_fee
 
+    def _apply_xt_order_fields(self, order: Order, order_info: dict) -> None:
+        """把 XtOrder 回报中的完整字段同步到内部订单对象。
+
+        Args:
+            order: 要更新的内部订单对象。
+            order_info: 标准化后的 XtOrder 字段字典。
+        """
+        order.account_type = int(order_info.get("account_type", 0) or 0)
+        order.account_id = str(order_info.get("account_id", "") or "")
+        order.xt_stock_code = str(order_info.get("xt_stock_code", "") or "")
+        order.order_sysid = str(order_info.get("order_sysid", "") or "")
+        order.order_time = int(order_info.get("order_time", 0) or 0)
+        order.xt_order_type = int(order_info.get("order_type", 0) or 0)
+        order.price_type = int(order_info.get("price_type", 0) or 0)
+        order.xt_order_status = int(order_info.get("order_status", 0) or 0)
+        order.status_msg = str(order_info.get("status_msg", "") or "")
+        order.xt_direction = int(order_info.get("direction", 0) or 0)
+        order.offset_flag = int(order_info.get("offset_flag", 0) or 0)
+        order.secu_account = str(order_info.get("secu_account", "") or "")
+        order.instrument_name = str(order_info.get("instrument_name", "") or "")
+        order.xt_fields = dict(order_info.get("xt_fields", {}) or {})
+        if not order.stock_code:
+            order.stock_code = str(order_info.get("stock_code", "") or "")
+        if not order.strategy_name:
+            order.strategy_name = str(order_info.get("strategy_name", "") or "")
+        if not order.remark:
+            order.remark = str(order_info.get("order_remark", "") or "")
+        if not order.quantity:
+            order.quantity = int(order_info.get("order_volume", 0) or 0)
+        if not order.price:
+            order.price = float(order_info.get("price", 0.0) or 0.0)
+
+    @staticmethod
+    def _resolve_filled_amount(order: Order, filled_amount: float, order_info: Optional[dict]) -> float:
+        """优先使用显式成交额，否则退回“成交量 × 成交均价”估算。"""
+        if filled_amount:
+            return float(filled_amount)
+        if not order_info:
+            return order.filled_amount
+        traded_amount = float(order_info.get("traded_amount", 0.0) or 0.0)
+        if traded_amount > 0:
+            return traded_amount
+        traded_volume = int(order_info.get("traded_volume", 0) or 0)
+        traded_price = float(order_info.get("traded_price", 0.0) or 0.0)
+        if traded_volume > 0 and traded_price > 0:
+            return traded_volume * traded_price
+        return order.filled_amount
+
+    def _recalculate_order_fee(self, order: Order) -> None:
+        """根据订单累计成交额重新计算订单总费用。
+
+        这里按“整张订单的累计成交额”合并计算，
+        避免部分成交逐笔向上取整导致手续费累计偏大。
+        """
+        fee = self._calculate_fee(order.stock_code, order.direction, order.filled_amount)
+        order.buy_commission = fee.buy_commission
+        order.sell_commission = fee.sell_commission
+        order.stamp_tax = fee.stamp_tax
+        order.total_fee = fee.total_fee
+        order.commission = fee.total_fee
+
+    def _calculate_fee(self, stock_code: str, direction: OrderDirection, amount: float) -> FeeBreakdown:
+        """按累计成交额计算费用。"""
+        if not self._fee_schedule:
+            return FeeBreakdown()
+        return self._fee_schedule.calculate(stock_code, direction, amount)
+
+    @staticmethod
+    def _diff_fee(current: FeeBreakdown, previous: FeeBreakdown) -> FeeBreakdown:
+        """计算两次累计费率结果之间的差值，作为本次新增成交的费用。"""
+        return FeeBreakdown(
+            buy_commission=max(0.0, current.buy_commission - previous.buy_commission),
+            sell_commission=max(0.0, current.sell_commission - previous.sell_commission),
+            stamp_tax=max(0.0, current.stamp_tax - previous.stamp_tax),
+            total_fee=max(0.0, current.total_fee - previous.total_fee),
+            is_t0=current.is_t0,
+        )
+
     def on_async_response(self, seq: int, xt_order_id: int) -> None:
-        """绑定异步下单序列号与柜台订单号"""
+        """绑定异步下单序列号与柜台订单号。
+
+        Args:
+            seq: 异步下单返回的序列号。
+            xt_order_id: 柜台真实订单号。
+        """
         with self._lock:
             uuid = self._seq_to_uuid.pop(seq, None)
             if uuid:
@@ -272,7 +407,7 @@ class OrderManager:
         logger.debug("OrderManager: async_response seq=%d → xt_id=%d", seq, xt_order_id)
 
     def register_seq(self, seq: int, order_uuid: str) -> None:
-        """为异步下单注册 seq → uuid 映射"""
+        """为异步下单预注册 `seq -> order_uuid` 映射。"""
         with self._lock:
             self._seq_to_uuid[int(seq)] = order_uuid
 
