@@ -36,6 +36,11 @@ class BaseStrategy(ABC):
         stock_code:        str
         status:            StrategyStatus
         config:            StrategyConfig
+
+    建议把这个基类理解成“策略执行骨架”：
+    1. 子类只负责回答“现在该不该买 / 卖”。
+    2. 基类负责把信号变成委托、维护待成交订单、处理订单回调。
+    3. 基类还负责快照持久化与恢复，让子类能跨交易日续跑。
     """
 
     # ---- 子类需覆盖的类属性 -------------------------------------------------
@@ -115,8 +120,10 @@ class BaseStrategy(ABC):
         Args:
             tick: 当前标的的最新标准化行情对象。
         """
+        # 非运行态时直接忽略行情，避免暂停/停止中的策略继续动作。
         if self.status not in (StrategyStatus.RUNNING,):
             return
+        # 每个策略实例只处理自己绑定的那个标的。
         if tick.stock_code != self.stock_code:
             return
         try:
@@ -124,7 +131,7 @@ class BaseStrategy(ABC):
             if self._position_mgr:
                 self._position_mgr.update_price(self.stock_code, tick.last_price)
 
-            # 风控前置检查
+            # 风控前置检查：先看是否需要立即止损/止盈，只有通过后才交给子类继续生成新信号。
             if self._check_risk(tick):
                 return
 
@@ -147,6 +154,7 @@ class BaseStrategy(ABC):
         Returns:
             若已触发止损或止盈并完成处理，则返回 `True`。
         """
+        # 止损优先级高于止盈，先检查下行风险。
         if self.check_stop_loss(tick):
             logger.warning("Strategy[%s] 触发止损 price=%.3f stop=%.3f",
                            self.strategy_id[:8], tick.last_price,
@@ -167,6 +175,7 @@ class BaseStrategy(ABC):
         策略只负责生成信号；真正的下单动作统一走交易执行器，
         这样可以让“策略逻辑”和“交易接口细节”彻底分离。
         """
+        # 统一把信号字典拆成标准字段，子类只要按约定返回 dict 即可。
         action = signal.get("action", "").upper()
         price = float(signal.get("price", 0))
         quantity = int(signal.get("quantity", 0))
@@ -174,11 +183,13 @@ class BaseStrategy(ABC):
         remark = signal.get("remark", action)
 
         if action == "BUY":
+            # BUY 同时支持“按金额下单”和“按股数下单”两种模式。
             if amount > 0:
                 self.add_position_by_amount(price, amount, remark)
             elif quantity > 0:
                 self.add_position(price, quantity, remark)
         elif action == "SELL":
+            # SELL 这里表示减仓，不一定是全平；全平走 CLOSE。
             if quantity > 0:
                 self.reduce_position(price, quantity, remark)
         elif action == "CLOSE":
@@ -194,6 +205,7 @@ class BaseStrategy(ABC):
         # 这里的风控口径是“当前持仓市值 + 本次计划委托金额”。
         if self._position_mgr and self.config.max_position_amount > 0:
             pos = self._position_mgr.get_position(self.strategy_id)
+            # current_value 是当前策略实例已持仓的市值；order_value 是本次计划买入金额。
             current_value = pos.market_value if pos else 0.0
             order_value = price * quantity
             if current_value + order_value > self.config.max_position_amount:
@@ -206,6 +218,7 @@ class BaseStrategy(ABC):
                 quantity = int((allowed_amount / price) // 100) * 100
                 logger.info("Strategy[%s] 订单重置为允许的最大数量: %d 股", self.strategy_id[:8], quantity)
 
+            # 真正的买入委托由 trade_executor 发出，策略层不直接接触券商接口细节。
         order = self._trade_executor.buy_limit(
             self.strategy_id, self.strategy_name,
             self.stock_code, price, quantity, remark
@@ -221,7 +234,7 @@ class BaseStrategy(ABC):
         if not self._trade_executor:
             return None
             
-        # 仓位上限风控
+        # 仓位上限风控：即使策略传进来一个金额，也要先约束到 max_position_amount 以内。
         if self._position_mgr and self.config.max_position_amount > 0:
             pos = self._position_mgr.get_position(self.strategy_id)
             current_value = pos.market_value if pos else 0.0
@@ -232,6 +245,7 @@ class BaseStrategy(ABC):
                 if amount < price * 100:
                     return None
 
+        # buy_by_amount 由执行器决定如何换算成股数，基类只负责把意图往下传。
         order = self._trade_executor.buy_by_amount(
             self.strategy_id, self.strategy_name,
             self.stock_code, price, amount, remark
@@ -244,6 +258,7 @@ class BaseStrategy(ABC):
         """按指定价格和数量减仓。"""
         if not self._trade_executor:
             return None
+        # 减仓不会自动把策略停掉，是否停掉要等订单回报后结合剩余仓位再判断。
         order = self._trade_executor.sell_limit(
             self.strategy_id, self.strategy_name,
             self.stock_code, price, quantity, remark
@@ -255,6 +270,7 @@ class BaseStrategy(ABC):
         """提交清仓请求。"""
         if not self._trade_executor:
             return None
+        # close_position 表示“把当前策略实例对应仓位全部平掉”，由执行器内部决定具体可卖数量。
         order = self._trade_executor.close_position(
             self.strategy_id, self.strategy_name,
             self.stock_code, remark=remark or "策略平仓"
@@ -268,6 +284,7 @@ class BaseStrategy(ABC):
 
     def check_stop_loss(self, tick: TickData) -> bool:
         """止损检查（子类可覆盖）"""
+        # 基类只支持固定价格止损，更复杂的逻辑由子类覆盖这个方法。
         if self.config.stop_loss_price <= 0:
             return False
         pos = self._position_mgr.get_position(self.strategy_id) if self._position_mgr else None
@@ -277,6 +294,7 @@ class BaseStrategy(ABC):
 
     def check_take_profit(self, tick: TickData) -> bool:
         """止盈检查（子类可覆盖）"""
+        # 与止损相同，基类只实现最简单的固定价格止盈。
         if self.config.take_profit_price <= 0:
             return False
         pos = self._position_mgr.get_position(self.strategy_id) if self._position_mgr else None
@@ -315,6 +333,7 @@ class BaseStrategy(ABC):
             order: 最新状态的订单对象。
         """
         try:
+            # 只处理属于自己的订单回报，避免不同策略实例互相污染状态。
             if order.strategy_id != self.strategy_id:
                 return
             from config.enums import OrderStatus, OrderDirection
@@ -334,6 +353,7 @@ class BaseStrategy(ABC):
                 if not pos or pos.total_quantity <= 0:
                     self.stop()
 
+            # 类级统计和子类扩展钩子都放在订单回报阶段更新，保证与真实成交状态一致。
             self.__class__._sync_class_stats(self._position_mgr)
             self._on_order_update_hook(order)
         except Exception as e:
@@ -353,6 +373,7 @@ class BaseStrategy(ABC):
             pos = self._position_mgr.get_position(self.strategy_id)
 
         from position.models import PositionInfo
+        # 这里把“框架层通用状态”统一封装进快照；子类特有状态再走 _get_custom_state 补充。
         return StrategySnapshot(
             strategy_id=self.strategy_id,
             strategy_name=self.strategy_name,
@@ -367,6 +388,7 @@ class BaseStrategy(ABC):
 
     def restore_from_snapshot(self, snapshot: StrategySnapshot) -> None:
         """从历史快照恢复策略状态。"""
+        # 先恢复框架通用字段，再交给 position_manager 和子类去恢复各自负责的状态。
         self.strategy_id = snapshot.strategy_id
         self.stock_code = snapshot.stock_code
         self.status = snapshot.status
@@ -395,6 +417,7 @@ class BaseStrategy(ABC):
 
     def _track_order(self, order: Order) -> None:
         """把订单记录到待处理列表和历史列表。"""
+        # 活跃订单进入 pending；无论是否活跃，都保留一份历史，便于审计和排查。
         if order and order.is_active():
             self._pending_orders[order.order_uuid] = order
         self._orders_history.append(order)
@@ -411,7 +434,8 @@ class BaseStrategy(ABC):
         try:
             with cls._lock:
                 positions = position_manager.get_all_positions()
-                # 统计该策略类的所有实例的持仓
+                # 统计该策略类的所有实例的持仓。
+                # 这里按 strategy_name 聚合，所以同一个策略类的不同实例会被合并统计。
                 class_positions = [p for p in positions.values() 
                                  if p.strategy_name == cls.strategy_name]
                 cls._current_positions_count = len(class_positions)

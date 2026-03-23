@@ -22,6 +22,9 @@ class Order:
 
     这个对象既保存框架内部统一字段，也保存完整的 XtOrder 关键字段。
     这样无论是策略层、持久化层还是问题排查，都能拿到足够完整的信息。
+
+    可以把它理解成“委托单当前状态的快照”。
+    它会随着回报不断更新，因此是一个会变化的对象。
     """
     order_uuid: str = field(default_factory=lambda: str(uuid.uuid4()))  # 框架内部订单唯一标识。
     strategy_id: str = ""  # 发起该委托的策略实例 ID。
@@ -66,6 +69,7 @@ class Order:
         Returns:
             bool: 如果订单还可能继续收到成交、撤单或状态更新，则返回 `True`。
         """
+        # 这里的活动态表示“订单生命周期尚未结束”，并不代表一定还能成交。
         return self.status in (
             OrderStatus.UNREPORTED,
             OrderStatus.WAIT_REPORTING,
@@ -81,6 +85,7 @@ class Order:
         Returns:
             int: 使用委托数量减去累计成交数量得到的剩余量。
         """
+        # 对部分成交订单，这个值会大于 0；对已全成或已撤终态，通常会归零。
         return self.quantity - self.filled_quantity
 
 
@@ -90,6 +95,9 @@ class TradeRecord:
 
     与 `Order` 不同，成交记录通常是不可变事件：一旦产生，主要用于驱动持仓更新、
     费用统计、日志记录和后续复盘分析。
+
+    如果说 ``Order`` 表示“我下了什么单”，
+    那么 ``TradeRecord`` 表示“交易所最终成交了什么”。
     """
 
     account_type: int = 0  # xtquant 返回的账号类型。

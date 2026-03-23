@@ -10,7 +10,11 @@ from typing import List
 
 @dataclass
 class FifoLot:
-    """先进先出（FIFO）成本追踪单位：一次买入批次"""
+    """先进先出（FIFO）成本追踪单位：一次买入批次。
+
+    在 FIFO 成本法下，持仓不会只保留一个平均成本，
+    而是把每次买入拆成独立 lot，卖出时按时间顺序逐批扣减。
+    """
     quantity: int = 0
     cost_price: float = 0.0
     buy_time: datetime = field(default_factory=datetime.now)
@@ -18,7 +22,11 @@ class FifoLot:
 
 @dataclass
 class PositionInfo:
-    """单个策略的持仓信息（内存中实时维护）"""
+    """单个策略的持仓信息（内存中实时维护）。
+
+    可以把它理解成“某个策略实例当前手里这只票的完整状态”。
+    它既包含数量和成本，也包含盈亏、费用和 FIFO 批次信息。
+    """
     strategy_id: str = ""
     strategy_name: str = ""
     stock_code: str = ""
@@ -47,6 +55,7 @@ class PositionInfo:
         注意：这里不会修改已实现盈亏，
         因为已实现盈亏只会在真实卖出成交时发生变化。
         """
+        # current_price / market_value / unrealized_pnl 都属于“可由最新价直接推导”的实时字段。
         self.current_price = price
         self.market_value = self.total_quantity * price
         if self.total_cost > 0:

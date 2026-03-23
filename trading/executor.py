@@ -32,6 +32,11 @@ class TradeExecutor:
     """交易执行器。
 
     该模块负责把策略发出的“买/卖/平仓/撤单意图”翻译成实际交易指令。
+
+    可以把它理解成“策略层和柜台接口之间的翻译层”：
+    1. 上游传入的是统一的内部意图。
+    2. 这里负责补齐数量、方向、市场代码、价格类型。
+    3. 最后交给 xtquant 或 mock 通道发出请求。
     """
 
     # A 股最小交易单位
@@ -64,6 +69,7 @@ class TradeExecutor:
                   stock_code: str, price: float,
                   quantity: int, remark: str = "") -> Order:
         """提交限价买入订单。"""
+        # 这里先构造内部 Order 对象，再统一交给 _submit_order 发出。
         order = Order(
             strategy_id=strategy_id,
             strategy_name=strategy_name,
@@ -79,6 +85,7 @@ class TradeExecutor:
     def buy_market(self, strategy_id: str, strategy_name: str,
                    stock_code: str, quantity: int, remark: str = "") -> Order:
         """提交市价买入订单。"""
+        # 市价单内部仍复用同一个 Order 模型，只是 price 作为参考值置 0。
         order = Order(
             strategy_id=strategy_id,
             strategy_name=strategy_name,
@@ -104,6 +111,7 @@ class TradeExecutor:
             logger.warning("buy_by_amount: 金额 %.0f 不足买1手 (price=%.3f)", amount, price)
             return self._failed_order(strategy_id, strategy_name, stock_code,
                                       OrderDirection.BUY, "金额不足")
+        # amount 仅表示上游意图；真正发单时仍落成“按股数委托”。
         order = Order(
             strategy_id=strategy_id,
             strategy_name=strategy_name,
@@ -123,6 +131,7 @@ class TradeExecutor:
                    stock_code: str, price: float,
                    quantity: int, remark: str = "") -> Order:
         """提交限价卖出订单。"""
+        # 卖出与买入一样，先走内部统一订单模型。
         order = Order(
             strategy_id=strategy_id,
             strategy_name=strategy_name,
@@ -158,6 +167,7 @@ class TradeExecutor:
         if self._position_mgr:
             pos = self._position_mgr.get_position(strategy_id)
             if pos:
+                # close_position 只卖“当前可用仓位”，不碰不可卖冻结部分。
                 available = pos.available_quantity
         if available <= 0:
             logger.warning("close_position: 无可用持仓 strategy=%s code=%s",
@@ -165,6 +175,7 @@ class TradeExecutor:
             return self._failed_order(strategy_id, strategy_name, stock_code,
                                       OrderDirection.SELL, "无可用持仓")
         if str(stock_code).startswith("5") and pos:
+            # ETF/基金类代码用市价平仓在某些环境下不稳定，这里保守改成贴近现价的限价卖出。
             ref_price = float(pos.current_price or pos.avg_cost or 0.0)
             if ref_price > 0:
                 limit_price = max(0.001, round(ref_price * 0.995, 3))
@@ -204,6 +215,7 @@ class TradeExecutor:
         if not trader or not _XT_AVAILABLE:
             logger.warning("cancel_order [MOCK]: uuid=%s xt_id=%d",
                            order_uuid[:8], order.xt_order_id)
+            # mock 模式下没有真实撤单回报，这里直接把内部状态切到已撤，便于上层流程继续。
             order.status = OrderStatus.CANCELED
             return True
 
@@ -252,6 +264,7 @@ class TradeExecutor:
                                                   OrderType.BY_QUANTITY)
                           else self._resolve_market_price_type(order.stock_code))
 
+            # order_stock_async 返回的是本地下单序列号 seq，真正的柜台订单号要等异步回报再绑定。
             seq = trader.order_stock_async(
                 account,
                 xt_code,
@@ -278,6 +291,7 @@ class TradeExecutor:
     @staticmethod
     def _calc_quantity(amount: float, price: float) -> int:
         """按金额计算可买数量，并向下取整到一手（100 股）。"""
+        # floor 后再乘 lot size，确保既不超预算，也符合 A 股整手规则。
         lots = math.floor(amount / price / TradeExecutor._LOT_SIZE)
         return lots * TradeExecutor._LOT_SIZE
 
@@ -285,6 +299,7 @@ class TradeExecutor:
     def _resolve_market_price_type(stock_code: str) -> int:
         """兼容不同 xtquant 版本的市价单常量命名。"""
         if str(stock_code).startswith("6"):
+            # 沪市和深市的市价枚举名称不完全一致，所以这里按候选常量列表逐个尝试。
             candidates = (
                 "MARKET_SH_INSTANT",
                 "MARKET_SH_CONVERT_5_LIMIT",
@@ -304,6 +319,7 @@ class TradeExecutor:
             if value is not None:
                 return value
 
+        # 找不到任何市价常量时，退回限价，至少保证接口还能正常调用。
         return xtconstant.FIX_PRICE
 
     @staticmethod
@@ -318,6 +334,7 @@ class TradeExecutor:
     def _failed_order(strategy_id: str, strategy_name: str, stock_code: str,
                       direction: OrderDirection, reason: str) -> Order:
         """构造一张失败订单对象，供上层统一处理。"""
+        # 失败也统一返回 Order，对上层来说就不需要区分“异常”和“失败订单对象”两套处理路径。
         order = Order(
             strategy_id=strategy_id,
             strategy_name=strategy_name,

@@ -23,6 +23,10 @@ class PositionManager:
 
     它只根据“成交结果”更新持仓，不直接发单。
     这样可以保证持仓状态始终以真实成交为准，而不是以委托为准。
+
+    可以把它理解成“成交到账本”的那一层：
+    1. 订单是否发出、是否成交，不由这里决定。
+    2. 一旦收到成交回报，这里负责把数量、成本、费用、盈亏全部记到账上。
     """
 
     def __init__(self, cost_method: str = "moving_average", data_manager=None, fee_schedule=None):
@@ -111,6 +115,7 @@ class PositionManager:
         with self._lock:
             for pos in self._positions.values():
                 if pos.stock_code == stock_code and pos.total_quantity > 0:
+                    # 一个股票可能被多个策略分别持有，所以这里按 stock_code 广播刷新所有相关仓位。
                     pos.refresh_market_value(price)
 
     # ------------------------------------------------------------------ 查询
@@ -166,6 +171,7 @@ class PositionManager:
             pos = self._positions.pop(strategy_id, None)
         if pos and self._data_mgr:
             try:
+                # 这里归档的是“策略结束时的已实现盈亏汇总”，不是逐笔成交明细。
                 pnl_info = {
                     "total_profit": pos.realized_pnl,
                     "total_commission": pos.total_commission,
@@ -189,6 +195,8 @@ class PositionManager:
             # 恢复时重新计算这些“可推导字段”，
             # 避免旧快照中的冗余值与当前规则不一致。
             position.is_t0 = self._resolve_is_t0(position.stock_code, position)
+            # available_quantity 恢复为 total_quantity，表示恢复时默认全部可卖；
+            # 若未来需要严格恢复 T+1 冻结细节，可在快照中继续扩展该状态。
             position.available_quantity = position.total_quantity
             position.total_commission = position.total_fees or position.total_commission
             self._positions[strategy_id] = position
@@ -216,6 +224,7 @@ class PositionManager:
             pos.total_cost += amount + total_fee
             pos.total_quantity += qty
             if pos.is_t0:
+                # T+0 品种当日买入后即可回转，所以可用数量同步增加。
                 pos.available_quantity += qty
             pos.avg_cost = pos.total_cost / pos.total_quantity if pos.total_quantity > 0 else 0
         else:  # FIFO
@@ -226,6 +235,7 @@ class PositionManager:
             pos.total_quantity += qty
             if pos.is_t0:
                 pos.available_quantity += qty
+            # 即便用 FIFO，avg_cost 仍保留一个整体均价，便于界面展示与快速查看。
             pos.avg_cost = pos.total_cost / pos.total_quantity if pos.total_quantity > 0 else 0
 
     def _apply_sell(self, pos: PositionInfo, trade: TradeRecord) -> None:
@@ -249,8 +259,10 @@ class PositionManager:
             pos.realized_pnl += profit
             pos.total_cost -= cost_sold
             pos.total_quantity -= qty
+            # 非 T+0 场景下，可用数量通常早已被交易系统冻结；这里统一按卖出数量回落本地可用值。
             pos.available_quantity = max(0, pos.available_quantity - qty)
             if pos.total_quantity <= 0:
+                # 仓位归零时，把可推导成本字段一并清零，避免残留浮点误差。
                 pos.total_cost = 0
                 pos.avg_cost = 0
                 pos.total_quantity = 0
@@ -266,11 +278,13 @@ class PositionManager:
                 lot.quantity -= take
                 remaining -= take
                 if lot.quantity == 0:
+                    # 一个 lot 被完全卖完后，就从队头移除。
                     pos.fifo_lots.pop(0)
             profit = net_amount - cost_basis
             pos.realized_pnl += profit
             pos.total_quantity -= qty
             pos.available_quantity = max(0, pos.available_quantity - qty)
+            # FIFO 下总成本由剩余 lot 重新汇总，而不是简单减一个平均成本。
             pos.total_cost = sum(l.quantity * l.cost_price for l in pos.fifo_lots)
             pos.avg_cost = pos.total_cost / pos.total_quantity if pos.total_quantity > 0 else 0
 
@@ -278,6 +292,7 @@ class PositionManager:
         """返回一笔成交应计入持仓口径的总费用。"""
         total_fee = float(getattr(trade, "total_fee", 0.0) or 0.0)
         if total_fee > 0:
+            # 新口径优先直接使用 total_fee，避免重复拼装费用。
             return total_fee
         # 兼容旧数据：如果还没有拆分费用字段，则退回旧的 commission 字段。
         return float(getattr(trade, "commission", 0.0) or 0.0)
@@ -292,6 +307,7 @@ class PositionManager:
         """
         explicit = getattr(trade_or_position, "is_t0", None)
         if explicit is True:
+            # 对象上显式声明 True 时，优先级最高。
             return True
         if self._fee_schedule:
             return self._fee_schedule.is_t0_security(stock_code)

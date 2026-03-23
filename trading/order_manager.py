@@ -23,6 +23,12 @@ class OrderManager:
     - 新订单先在这里注册
     - 状态更新回到这里
     - 成交回报也在这里落地并向外分发
+
+    如果按时间顺序理解：
+    1. TradeExecutor 发单后先调用 ``register_order``。
+    2. 柜台异步返回真实订单号时调用 ``on_async_response``。
+    3. 柜台订单状态变化时调用 ``update_order_status``。
+    4. 柜台成交回报到来时调用 ``on_trade``。
     """
 
     def __init__(self, data_manager=None, fee_schedule=None):
@@ -62,6 +68,7 @@ class OrderManager:
         with self._lock:
             self._orders[order.order_uuid] = order
             if order.xt_order_id:
+                # 有真实 xt_order_id 时，立即建立“柜台号 -> 内部 UUID”的反查映射。
                 self._xt_to_uuid[order.xt_order_id] = order.order_uuid
         if self._data_mgr:
             try:
@@ -91,6 +98,7 @@ class OrderManager:
         with self._lock:
             uuid = self._xt_to_uuid.get(xt_order_id)
             if not uuid:
+                # 柜台先推状态、后绑定映射时，可能暂时找不到本地订单，直接忽略等待后续回报。
                 return
             order = self._orders.get(uuid)
             if not order:
@@ -122,6 +130,7 @@ class OrderManager:
 
         if self._strategy_callback:
             try:
+                # 订单状态变化先通知策略，让策略有机会清理 pending、推进自身状态机。
                 self._strategy_callback(order)
             except Exception as e:
                 logger.error("OrderManager: 策略回调异常: %s", e, exc_info=True)
@@ -144,6 +153,8 @@ class OrderManager:
                 uuid = self._xt_to_uuid.get(xt_order_id)
                 order = self._orders.get(uuid) if uuid else None
 
+            # 如果能找到原订单，就尽量沿用原订单上的 strategy_id/strategy_name；
+            # 找不到时再从成交回报字段里兜底取值。
             strategy_id = order.strategy_id if order else ""
             strategy_name = str(trade_info.get("strategy_name", "") or "") or (order.strategy_name if order else "")
 
@@ -160,6 +171,7 @@ class OrderManager:
                 raw_direction=trade_info.get("direction", ""),
             )
 
+            # TradeRecord 是“已成交事实”，一旦构造完成就会被分发给持仓层和其他监听方。
             trade = TradeRecord(
                 account_type=int(trade_info.get("account_type", 0) or 0),
                 account_id=str(trade_info.get("account_id", "") or ""),
@@ -190,6 +202,7 @@ class OrderManager:
             # 更新订单已成交量
             if order:
                 with self._lock:
+                    # previous_fee / delta_fee 的组合，是为了把“整单累计费用”拆回“本次新增成交费用”。
                     previous_fee = self._calculate_fee(order.stock_code, direction, order.filled_amount)
                     order.filled_quantity += trade.quantity
                     order.filled_amount += trade.amount
@@ -221,6 +234,7 @@ class OrderManager:
             # 通知持仓模块
             if self._position_callback:
                 try:
+                    # 这里由 PositionManager 根据成交事实更新持仓数量、成本和盈亏。
                     self._position_callback(trade)
                 except Exception as e:
                     logger.error("OrderManager: 持仓回调异常: %s", e, exc_info=True)
@@ -235,6 +249,7 @@ class OrderManager:
             # 通知策略模块
             if order and self._strategy_callback:
                 try:
+                    # 成交后再通知策略，是为了让策略拿到更新后的 order 累计成交状态。
                     self._strategy_callback(order)
                 except Exception as e:
                     logger.error("OrderManager: 策略回调异常: %s", e, exc_info=True)
@@ -249,6 +264,7 @@ class OrderManager:
     def _infer_trade_direction(offset_flag: int, order_type: int, xt_direction: int,
                                fallback_order: Optional[Order], raw_direction) -> OrderDirection:
         """根据 XtTrade 字段推断买卖方向（优先 offset_flag/order_type）。"""
+        # xtquant 在不同回调里方向字段可能不一致，所以这里做多字段兜底推断。
         buy_markers = {23}
         sell_markers = {24}
 
@@ -265,6 +281,7 @@ class OrderManager:
             return OrderDirection.SELL
 
         if fallback_order:
+            # 前面都推不出来时，退回到原订单方向，至少保证内部口径一致。
             return fallback_order.direction
         return OrderDirection.BUY
 
@@ -284,6 +301,7 @@ class OrderManager:
         text = str(xt_traded_time)
         for fmt, length in (("%Y%m%d%H%M%S", 14), ("%Y%m%d", 8)):
             try:
+                # 有些环境返回到秒级，有些只给日期，这里两种格式都兼容。
                 return datetime.strptime(text[:length], fmt)
             except ValueError:
                 continue
@@ -292,6 +310,7 @@ class OrderManager:
     def _apply_fee_breakdown(self, trade: TradeRecord) -> None:
         """为成交补齐手续费拆分结果。"""
         if trade.amount <= 0 and trade.price > 0 and trade.quantity > 0:
+            # 有些成交回报不直接给 amount，这里按 price * quantity 兜底补齐。
             trade.amount = trade.price * trade.quantity
 
         if self._fee_schedule:
@@ -340,6 +359,7 @@ class OrderManager:
         if not order.quantity:
             order.quantity = int(order_info.get("order_volume", 0) or 0)
         if not order.price:
+            # 某些情况下本地下单对象价格为空，这里用回报里的价格回填。
             order.price = float(order_info.get("price", 0.0) or 0.0)
 
     @staticmethod
@@ -355,6 +375,7 @@ class OrderManager:
         traded_volume = int(order_info.get("traded_volume", 0) or 0)
         traded_price = float(order_info.get("traded_price", 0.0) or 0.0)
         if traded_volume > 0 and traded_price > 0:
+            # 某些回报只给了成交量和成交均价，没有直接给成交额。
             return traded_volume * traded_price
         return order.filled_amount
 
@@ -364,6 +385,7 @@ class OrderManager:
         这里按“整张订单的累计成交额”合并计算，
         避免部分成交逐笔向上取整导致手续费累计偏大。
         """
+        # 订单页展示的费用应当是“截至当前累计成交”的总费用，而不是最后一笔成交的费用。
         fee = self._calculate_fee(order.stock_code, order.direction, order.filled_amount)
         order.buy_commission = fee.buy_commission
         order.sell_commission = fee.sell_commission
@@ -398,6 +420,7 @@ class OrderManager:
         with self._lock:
             uuid = self._seq_to_uuid.pop(seq, None)
             if uuid:
+                # 异步下单先拿到 seq，再拿到 xt_order_id；这里完成两者与内部订单 UUID 的拼接。
                 self._xt_to_uuid[xt_order_id] = uuid
                 order = self._orders.get(uuid)
                 if order:
@@ -409,6 +432,7 @@ class OrderManager:
     def register_seq(self, seq: int, order_uuid: str) -> None:
         """为异步下单预注册 `seq -> order_uuid` 映射。"""
         with self._lock:
+            # 这个映射是异步下单模式下把“本地下单请求”和“后续柜台订单号”连起来的关键。
             self._seq_to_uuid[int(seq)] = order_uuid
 
     # ------------------------------------------------------------------ 查询

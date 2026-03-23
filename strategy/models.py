@@ -22,6 +22,9 @@ class StrategyConfig:
 
     这些参数通常在策略创建阶段确定，随后在运行时被策略逻辑反复引用。
     当某个字段取默认值时，通常表示“不启用该约束”或“由策略自行处理”。
+
+    可以把它理解成“创建策略实例时的一次性输入”。
+    其中 ``params`` 是预留给具体策略的扩展口，像 BBPP 的锚点日期、买入方法等都放这里。
     """
 
     stock_code: str = ""  # 策略绑定的股票代码。
@@ -39,6 +42,11 @@ class StrategySnapshot:
     策略运行过程中，除静态配置外还会产生诸如持仓、待完成订单、自定义中间
     状态等动态信息。框架在持久化时会将这些内容统一收敛到该快照对象中，便于
     在重启、跨交易日恢复时尽可能还原现场。
+
+    可以把它理解成“某一时刻的策略现场”。
+    和 ``StrategyConfig`` 的区别是：
+    - ``StrategyConfig`` 更偏初始化输入。
+    - ``StrategySnapshot`` 更偏运行中间态和恢复现场。
     """
 
     strategy_id: str = ""  # 策略实例唯一标识。
@@ -48,7 +56,7 @@ class StrategySnapshot:
     config: StrategyConfig = field(default_factory=StrategyConfig)  # 策略初始化配置副本。
     position: PositionInfo = field(default_factory=PositionInfo)  # 当前持仓状态快照。
     pending_order_uuids: List[str] = field(default_factory=list)  # 尚未完结的内部订单 UUID 列表。
-    custom_state: Dict[str, Any] = field(default_factory=dict)  # 策略自定义持久化状态。
+    custom_state: Dict[str, Any] = field(default_factory=dict)  # 策略自定义持久化状态，供子类保存自己的状态机变量。
     create_time: datetime = field(default_factory=datetime.now)  # 快照首次创建时间。
     update_time: datetime = field(default_factory=datetime.now)  # 快照最近一次更新时间。
 

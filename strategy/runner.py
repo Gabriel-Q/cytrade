@@ -293,7 +293,10 @@ class StrategyRunner:
             return
         try:
             with self._lock:
-                snapshots = [s.get_snapshot() for s in self._strategies]
+                snapshots = [
+                    s.get_snapshot() for s in self._strategies
+                    if s.status != StrategyStatus.STOPPED
+                ]
             self._data_mgr.save_strategy_state(snapshots)
         except Exception as e:
             logger.error("StrategyRunner: 保存状态失败: %s", e, exc_info=True)
@@ -314,6 +317,8 @@ class StrategyRunner:
         with self._lock:
             self._strategies.clear()
         for snap in snapshots:
+            if snap.status == StrategyStatus.STOPPED:
+                continue
             cls = self._find_strategy_class(snap.strategy_name)
             if not cls:
                 logger.warning("StrategyRunner: 未找到策略类 %s，跳过恢复",
