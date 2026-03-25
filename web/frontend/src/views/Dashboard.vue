@@ -108,6 +108,33 @@
         </el-col>
       </el-row>
     </el-card>
+
+    <el-card style="margin-top: 16px;">
+      <template #header>
+        <span>策略容量概览</span>
+      </template>
+      <el-table :data="capacitySummary" stripe empty-text="当前没有启用容量限制的策略">
+        <el-table-column prop="strategy_type" label="策略类型" min-width="160" />
+        <el-table-column prop="instance_count" label="实例数" width="90" />
+        <el-table-column label="名额使用" width="120">
+          <template #default="{ row }">{{ row.used }}/{{ row.limit }}</template>
+        </el-table-column>
+        <el-table-column prop="occupying_count" label="占用中" width="90" />
+        <el-table-column prop="waiting_count" label="排队中" width="90" />
+        <el-table-column prop="remaining" label="剩余" width="90" />
+        <el-table-column label="等待标的" min-width="260">
+          <template #default="{ row }">
+            <div v-if="row.waiting_items.length" class="capacity-chip-wrap">
+              <div v-for="item in row.waiting_items" :key="item.strategy_id" class="capacity-chip">
+                <div class="capacity-chip-code">{{ item.stock_code }}</div>
+                <div class="capacity-chip-name">{{ item.stock_name || item.strategy_name }}</div>
+              </div>
+            </div>
+            <div v-else class="capacity-empty-inline">-</div>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
   </div>
 </template>
 
@@ -117,13 +144,14 @@ import { storeToRefs } from 'pinia'
 import { useSystemStore } from '../stores/system'
 
 const store = useSystemStore()
-const { status, positionSummary } = storeToRefs(store)
+const { status, positionSummary, capacitySummary } = storeToRefs(store)
 let timer = null
 
 function refresh() {
   // 首页展示的是摘要数据，因此同时刷新系统状态和持仓汇总。
   store.fetchStatus()
   store.fetchPositionSummary()
+  store.fetchCapacitySummary()
 }
 
 function fmt2(value) {
@@ -156,4 +184,19 @@ onUnmounted(() => {
 .label { color: #999; margin-bottom: 8px; }
 .number { font-size: 24px; font-weight: bold; }
 .sub-number { font-size: 20px; font-weight: bold; }
+.capacity-wait-text { color: #b45309; }
+.capacity-list { margin-top: 18px; }
+.capacity-list-title { font-size: 14px; font-weight: 700; margin-bottom: 10px; color: #1f2937; }
+.capacity-chip-wrap { display: flex; flex-wrap: wrap; gap: 10px; }
+.capacity-chip {
+  min-width: 140px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #fff7e6 0%, #fde7b1 100%);
+  border: 1px solid #f2cc7d;
+}
+.capacity-chip-code { font-size: 13px; font-weight: 800; color: #92400e; }
+.capacity-chip-name { margin-top: 4px; font-size: 12px; color: #7c5a10; }
+.capacity-empty { margin-top: 16px; color: #6b7280; font-size: 13px; }
+.capacity-empty-inline { color: #9ca3af; font-size: 13px; }
 </style>

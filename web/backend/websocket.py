@@ -22,6 +22,8 @@ except ImportError:
     WebSocketState = None
 
 from monitor.logger import get_logger
+from core.security_lookup import security_lookup
+from web.backend import routes
 from web.backend.status_map import order_status_text
 
 logger = get_logger("system")
@@ -30,6 +32,21 @@ if _FASTAPI:
     ws_router = APIRouter()
 else:
     ws_router = None
+
+
+def _format_strategy_name(strategy_name: str, strategy_id: str) -> str:
+    """给策略名称附带策略 ID，便于前端区分同名策略。"""
+    name = str(strategy_name or "").strip()
+    sid = str(strategy_id or "").strip()
+    if not sid:
+        return name
+    short_sid = sid[-5:]
+    if not name:
+        return short_sid
+    suffix = f" [{short_sid}]"
+    if name.endswith(suffix):
+        return name
+    return f"{name}{suffix}"
 
 
 class WebSocketManager:
@@ -87,6 +104,7 @@ class WebSocketManager:
         self.broadcast_sync({
             "type": "tick",
             "code": code,
+            "stock_name": routes._resolve_stock_name(code),
             "price": price,
             "latency_ms": latency_ms,
             "time": datetime.now().isoformat(),
@@ -97,6 +115,16 @@ class WebSocketManager:
         self.broadcast_sync({
             "type": "order_update",
             "order_uuid": order.order_uuid,
+            "strategy_id": getattr(order, "strategy_id", ""),
+            "strategy_name": _format_strategy_name(
+                getattr(order, "strategy_name", ""),
+                getattr(order, "strategy_id", ""),
+            ),
+            "stock_code": getattr(order, "stock_code", ""),
+            "stock_name": routes._resolve_stock_name(
+                getattr(order, "stock_code", ""),
+                fallback=str(getattr(order, "instrument_name", "") or ""),
+            ),
             "status": order.status.value,
             "status_text": order_status_text(order.status.value),
             "filled_quantity": order.filled_quantity,
@@ -109,7 +137,9 @@ class WebSocketManager:
         self.broadcast_sync({
             "type": "position_update",
             "strategy_id": pos.strategy_id,
+            "strategy_name": _format_strategy_name(pos.strategy_name, pos.strategy_id),
             "stock_code": pos.stock_code,
+            "stock_name": routes._resolve_stock_name(pos.stock_code),
             "total_quantity": pos.total_quantity,
             "avg_cost": pos.avg_cost,
             "unrealized_pnl": pos.unrealized_pnl,
@@ -124,8 +154,12 @@ class WebSocketManager:
             "xt_order_id": trade.xt_order_id,
             "order_uuid": trade.order_uuid,
             "strategy_id": trade.strategy_id,
-            "strategy_name": trade.strategy_name,
+            "strategy_name": _format_strategy_name(trade.strategy_name, trade.strategy_id),
             "stock_code": trade.stock_code,
+            "stock_name": routes._resolve_stock_name(
+                trade.stock_code,
+                fallback=str(getattr(trade, "instrument_name", "") or ""),
+            ),
             "account_type": getattr(trade, "account_type", 0),
             "account_id": getattr(trade, "account_id", ""),
             "order_type": getattr(trade, "order_type", 0),

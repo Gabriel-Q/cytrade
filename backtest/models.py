@@ -35,7 +35,12 @@ class BacktestConfig:
     end_date: str = ""
     period: str = "1m"
     initial_cash: float = 1_000_000.0
+    performance_base_equity: float = 0.0
     slippage: float = 0.01
+    force_close_on_end_day: bool = False
+    benchmark_code: str = "510050.SH"
+    benchmark_daily_returns: Dict[str, float] = field(default_factory=dict)
+    daily_close_equity_series: Dict[str, float] = field(default_factory=dict)
     report_path: str = "backtest_report.html"
 
 
@@ -63,11 +68,15 @@ class BacktestBar:
     day_low: float = 0.0
     cumulative_volume: int = 0
     cumulative_amount: float = 0.0
+    bid_prices: List[float] = field(default_factory=list)
+    bid_volumes: List[int] = field(default_factory=list)
+    ask_prices: List[float] = field(default_factory=list)
+    ask_volumes: List[int] = field(default_factory=list)
 
     def to_tick(self) -> TickData:
         """把分钟级 bar 转成策略可消费的 TickData。
 
-        第一阶段用“分钟级模拟 tick”驱动策略：
+        第一阶段既支持“分钟级 bar 模拟 tick”，也支持“真实 tick 行”回放：
         - last_price 用当前分钟收盘价
         - open/high/low 用当日视角字段
         - volume/amount 用日内累计字段
@@ -81,6 +90,10 @@ class BacktestBar:
             pre_close=float(self.pre_close),
             volume=int(self.cumulative_volume),
             amount=float(self.cumulative_amount),
+            bid_prices=list(self.bid_prices),
+            bid_volumes=list(self.bid_volumes),
+            ask_prices=list(self.ask_prices),
+            ask_volumes=list(self.ask_volumes),
             data_time=self.data_time,
             recv_time=self.data_time,
             latency_ms=0.0,
@@ -103,6 +116,7 @@ class EquityPoint:
     data_time: datetime = field(default_factory=datetime.now)
     cash: float = 0.0
     market_value: float = 0.0
+    invested_capital: float = 0.0
     equity: float = 0.0
     drawdown: float = 0.0
 
@@ -152,6 +166,7 @@ class BacktestResult:
     metrics: Dict[str, float] = field(default_factory=dict)
     equity_curve: List[EquityPoint] = field(default_factory=list)
     daily_returns: List[DailyReturnPoint] = field(default_factory=list)
+    benchmark_daily_returns: List[DailyReturnPoint] = field(default_factory=list)
     closed_trades: List[ClosedTrade] = field(default_factory=list)
     orders: List[dict] = field(default_factory=list)
     trades: List[dict] = field(default_factory=list)

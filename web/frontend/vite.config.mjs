@@ -4,6 +4,10 @@ import AutoImport from 'unplugin-auto-import/vite'
 import Components from 'unplugin-vue-components/vite'
 import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
 
+const backendPort = process.env.VITE_BACKEND_PORT || '8080'
+const backendHttpTarget = `http://127.0.0.1:${backendPort}`
+const backendWsTarget = `ws://127.0.0.1:${backendPort}`
+
 export default defineConfig({
   plugins: [
     vue(),
@@ -31,11 +35,11 @@ export default defineConfig({
     port: 3000,
     proxy: {
       '/api': {
-        target: 'http://localhost:8080',
+        target: backendHttpTarget,
         changeOrigin: true,
       },
       '/ws': {
-        target: 'ws://localhost:8080',
+        target: backendWsTarget,
         ws: true,
       }
     }

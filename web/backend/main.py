@@ -35,6 +35,7 @@ _order_manager = None  # 订单管理器，供订单与成交接口使用。
 _data_manager = None  # 数据管理器，供历史记录与快照接口使用。
 _connection_manager = None  # 交易连接管理器，供系统状态接口使用。
 _trade_executor = None  # 交易执行器，供人工下单或平仓接口使用。
+_data_subscription = None  # 行情订阅管理器，供系统状态接口读取最新数据时间与延迟。
 _ws_manager = None  # WebSocket 管理器实例，由应用创建时初始化。
 
 
@@ -49,20 +50,22 @@ def _get_frontend_dist_dir() -> Path:
 
 def init_app_context(strategy_runner=None, position_manager=None,
                      order_manager=None, data_manager=None,
-                     connection_manager=None, trade_executor=None):
+                     connection_manager=None, trade_executor=None,
+                     data_subscription=None):
     """把主程序创建的核心对象注入到 Web 层全局上下文中。
 
     Web 路由模块本身不负责对象构造，而是通过该函数接收主程序已经装配完成的
     运行时依赖。这样可以避免 Web 层直接反向依赖系统启动流程。
     """
     global _strategy_runner, _position_manager, _order_manager
-    global _data_manager, _connection_manager, _trade_executor
+    global _data_manager, _connection_manager, _trade_executor, _data_subscription
     _strategy_runner = strategy_runner
     _position_manager = position_manager
     _order_manager = order_manager
     _data_manager = data_manager
     _connection_manager = connection_manager
     _trade_executor = trade_executor
+    _data_subscription = data_subscription
 
 
 # ---- App 工厂 -------------------------------------------------------
@@ -122,6 +125,7 @@ def create_app():
     routes._data_manager = _data_manager
     routes._connection_manager = _connection_manager
     routes._trade_executor = _trade_executor
+    routes._data_subscription = _data_subscription
     routes._ws_manager = _ws_manager
 
     frontend_dist = _get_frontend_dist_dir()

@@ -119,6 +119,7 @@ class MyXtQuantTraderCallback(XtQuantTraderCallback):
             trade_info = {
                 "account_type": int(getattr(trade, "account_type", 0) or 0),
                 "account_id": str(getattr(trade, "account_id", "") or ""),
+                "strategy_id": str(getattr(trade, "strategy_id", "") or ""),
                 "stock_code": self._xt_to_code(str(trade.stock_code or "")),
                 "order_type": int(getattr(trade, "order_type", 0) or 0),
                 "traded_id": str(getattr(trade, "traded_id", "") or ""),
@@ -160,7 +161,14 @@ class MyXtQuantTraderCallback(XtQuantTraderCallback):
             xt_id = int(getattr(order_error, "order_id", 0) or 0)
             err_msg = str(getattr(order_error, "error_msg", "unknown") or "unknown")
             logger.error("[Callback] 下单失败 order_id=%s msg=%s", xt_id, err_msg)
-            self._order_mgr.update_order_status(xt_order_id=xt_id, status=OrderStatus.JUNK)
+            self._order_mgr.update_order_status(
+                xt_order_id=xt_id,
+                status=OrderStatus.JUNK,
+                order_info={
+                    "status_msg": err_msg,
+                    "order_status": 57,
+                },
+            )
         except Exception as e:
             logger.error("[Callback] on_order_error 异常: %s", e, exc_info=True)
 

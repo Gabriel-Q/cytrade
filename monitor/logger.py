@@ -8,6 +8,7 @@
 - 仅摘要模式（避免终端刷屏）
 """
 import gzip
+import glob
 import logging
 import logging.handlers
 import os
@@ -74,6 +75,7 @@ class LogManager:
         self._summary_mode = summary_mode
         self._loggers: dict[str, logging.Logger] = {}
         self._summary_filter = _SummaryFilter()
+        self._pid = os.getpid()
         os.makedirs(log_dir, exist_ok=True)
         self.setup_logging()
 
@@ -127,6 +129,24 @@ class LogManager:
             if mtime < cutoff:
                 os.remove(fpath)
 
+    def get_log_file_path(self, name: str = "system") -> str:
+        """返回当前进程写入的日志文件路径。"""
+        return os.path.join(self._log_dir, f"{name}.{self._pid}.log")
+
+    def find_latest_log_file(self, name: str = "system") -> Optional[str]:
+        """查找指定分类最近更新的日志文件，兼容旧文件名与 PID 文件名。"""
+        patterns = [
+            os.path.join(self._log_dir, f"{name}.*.log"),
+            os.path.join(self._log_dir, f"{name}.log"),
+        ]
+        candidates: list[str] = []
+        for pattern in patterns:
+            candidates.extend(glob.glob(pattern))
+        candidates = [path for path in candidates if os.path.isfile(path)]
+        if not candidates:
+            return None
+        return max(candidates, key=os.path.getmtime)
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -141,7 +161,7 @@ class LogManager:
             return lgr
 
         # ---- 滚动文件 Handler ----
-        log_file = os.path.join(self._log_dir, f"{name}.log")
+        log_file = self.get_log_file_path(name)
         fh = logging.handlers.TimedRotatingFileHandler(
             log_file, when="midnight", backupCount=self._max_days,
             encoding="utf-8"
@@ -196,4 +216,14 @@ def get_logger(name: str = "system") -> logging.Logger:
     return LogManager().get_logger(name)
 
 
-__all__ = ["LogManager", "get_logger"]
+def get_log_file_path(name: str = "system") -> str:
+    """返回当前进程的日志文件路径。"""
+    return LogManager().get_log_file_path(name)
+
+
+def find_latest_log_file(name: str = "system") -> Optional[str]:
+    """返回最新的日志文件路径，供 Web 等读取侧使用。"""
+    return LogManager().find_latest_log_file(name)
+
+
+__all__ = ["LogManager", "find_latest_log_file", "get_log_file_path", "get_logger"]

@@ -3,6 +3,7 @@
 本模块的职责是把策略层发出的交易意图，转换为底层交易接口可执行的
 下单或撤单请求。它不维护最终成交结果，真正的订单状态仍以后续回调为准。
 """
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 import math
 import time
 from typing import Optional
@@ -23,7 +24,10 @@ except ImportError:
     class xtconstant:  # type: ignore
         STOCK_BUY = 23
         STOCK_SELL = 24
+        LATEST_PRICE = 5
         FIX_PRICE = 11       # 限价
+        MARKET_SH_CONVERT_5_CANCEL = 43
+        MARKET_SZ_CONVERT_5_CANCEL = 46
         MARKET_SH_INSTANT = 42   # 上海市价（最优五档即时成交）
         MARKET_SZ_CONVERT = 45   # 深圳市价（即时成交剩余转限价）
 
@@ -82,21 +86,47 @@ class TradeExecutor:
         )
         return self._submit_order(order)
 
-    def buy_market(self, strategy_id: str, strategy_name: str,
+    def buy_latest(self, strategy_id: str, strategy_name: str,
                    stock_code: str, quantity: int, remark: str = "") -> Order:
-        """提交市价买入订单。"""
-        # 市价单内部仍复用同一个 Order 模型，只是 price 作为参考值置 0。
-        order = Order(
+        """提交最新价买入订单。"""
+        return self._submit_order(self._build_market_order(
             strategy_id=strategy_id,
             strategy_name=strategy_name,
             stock_code=stock_code,
             direction=OrderDirection.BUY,
-            order_type=OrderType.MARKET,
-            price=0.0,
             quantity=quantity,
+            requested_price_type=self._resolve_latest_price_type(),
+            remark=remark or f"最新价买入 {stock_code}",
+        ))
+
+    def buy_best5_or_cancel(self, strategy_id: str, strategy_name: str,
+                            stock_code: str, quantity: int, remark: str = "") -> Order:
+        """提交最优五档即时成交剩余撤销买单。"""
+        return self._submit_order(self._build_market_order(
+            strategy_id=strategy_id,
+            strategy_name=strategy_name,
+            stock_code=stock_code,
+            direction=OrderDirection.BUY,
+            quantity=quantity,
+            requested_price_type=self._resolve_best5_or_cancel_price_type(stock_code),
+            remark=remark or f"最优五档买入 {stock_code}",
+        ))
+
+    def buy_market(self, strategy_id: str, strategy_name: str,
+                   stock_code: str, quantity: int, remark: str = "") -> Order:
+        """提交市价买入订单。
+
+        当前默认实现仍映射到 ``buy_latest``，保持历史行为不变。
+        如果后续某个策略要改成 best5，下游策略可直接显式调用
+        ``buy_best5_or_cancel``，而不是依赖这里做全局切换。
+        """
+        return self.buy_latest(
+            strategy_id,
+            strategy_name,
+            stock_code,
+            quantity,
             remark=remark or f"市价买入 {stock_code}",
         )
-        return self._submit_order(order)
 
     def buy_by_amount(self, strategy_id: str, strategy_name: str,
                       stock_code: str, price: float,
@@ -144,26 +174,55 @@ class TradeExecutor:
         )
         return self._submit_order(order)
 
-    def sell_market(self, strategy_id: str, strategy_name: str,
+    def sell_latest(self, strategy_id: str, strategy_name: str,
                     stock_code: str, quantity: int, remark: str = "") -> Order:
-        """提交市价卖出订单。"""
-        order = Order(
+        """提交最新价卖出订单。"""
+        return self._submit_order(self._build_market_order(
             strategy_id=strategy_id,
             strategy_name=strategy_name,
             stock_code=stock_code,
             direction=OrderDirection.SELL,
-            order_type=OrderType.MARKET,
-            price=0.0,
             quantity=quantity,
+            requested_price_type=self._resolve_latest_price_type(),
+            remark=remark or f"最新价卖出 {stock_code}",
+        ))
+
+    def sell_best5_or_cancel(self, strategy_id: str, strategy_name: str,
+                             stock_code: str, quantity: int, remark: str = "") -> Order:
+        """提交最优五档即时成交剩余撤销卖单。"""
+        return self._submit_order(self._build_market_order(
+            strategy_id=strategy_id,
+            strategy_name=strategy_name,
+            stock_code=stock_code,
+            direction=OrderDirection.SELL,
+            quantity=quantity,
+            requested_price_type=self._resolve_best5_or_cancel_price_type(stock_code),
+            remark=remark or f"最优五档卖出 {stock_code}",
+        ))
+
+    def sell_market(self, strategy_id: str, strategy_name: str,
+                    stock_code: str, quantity: int, remark: str = "") -> Order:
+        """提交市价卖出订单。
+
+        当前默认实现仍映射到 ``sell_latest``。后续若某个策略要切到别的
+        卖出方式，直接在策略层显式改调用目标即可。
+        """
+        return self.sell_latest(
+            strategy_id,
+            strategy_name,
+            stock_code,
+            quantity,
             remark=remark or f"市价卖出 {stock_code}",
         )
-        return self._submit_order(order)
 
     def close_position(self, strategy_id: str, strategy_name: str,
                        stock_code: str, remark: str = "") -> Order:
-        """卖出该策略当前全部可用持仓。"""
+        """卖出该策略当前全部可用持仓。
+
+        当前平仓默认复用 ``sell_market -> sell_latest``，保持模拟盘口径一致。
+        后续如果某个策略想切到其他卖出方式，直接修改策略调用即可。
+        """
         available = 0
-        pos = None
         if self._position_mgr:
             pos = self._position_mgr.get_position(strategy_id)
             if pos:
@@ -174,23 +233,7 @@ class TradeExecutor:
                            strategy_id[:8], stock_code)
             return self._failed_order(strategy_id, strategy_name, stock_code,
                                       OrderDirection.SELL, "无可用持仓")
-        if str(stock_code).startswith("5") and pos:
-            # ETF/基金类代码用市价平仓在某些环境下不稳定，这里保守改成贴近现价的限价卖出。
-            ref_price = float(pos.current_price or pos.avg_cost or 0.0)
-            if ref_price > 0:
-                limit_price = max(0.001, round(ref_price * 0.995, 3))
-                logger.info(
-                    "close_position: 使用限价平仓 strategy=%s code=%s price=%.3f qty=%d",
-                    strategy_id[:8], stock_code, limit_price, available,
-                )
-                return self.sell_limit(
-                    strategy_id,
-                    strategy_name,
-                    stock_code,
-                    limit_price,
-                    available,
-                    remark=remark or f"平仓 {stock_code}",
-                )
+        # 模拟盘阶段统一按最新价卖出，保证建仓、止损、止盈/平仓三条链路口径一致。
         return self.sell_market(strategy_id, strategy_name, stock_code, available,
                                 remark=remark or f"平仓 {stock_code}")
 
@@ -240,6 +283,11 @@ class TradeExecutor:
         """
         trader = self._conn_mgr.get_trader() if self._conn_mgr else None
 
+        if order.order_type in (OrderType.LIMIT, OrderType.BY_AMOUNT, OrderType.BY_QUANTITY) and order.price > 0:
+            order.price = self._normalize_limit_price(order.stock_code, order.direction, order.price)
+
+        order.price_type = self._resolve_order_price_type(order)
+
         if not trader or not _XT_AVAILABLE:
             # Mock 模式下没有真实柜台，因此直接生成一个伪订单号，
             # 让后续策略链路依旧可以完整演练。
@@ -262,7 +310,8 @@ class TradeExecutor:
             price_type = (xtconstant.FIX_PRICE
                           if order.order_type in (OrderType.LIMIT, OrderType.BY_AMOUNT,
                                                   OrderType.BY_QUANTITY)
-                          else self._resolve_market_price_type(order.stock_code))
+                          else order.price_type)
+            order.price_type = price_type
 
             # order_stock_async 返回的是本地下单序列号 seq，真正的柜台订单号要等异步回报再绑定。
             seq = trader.order_stock_async(
@@ -283,10 +332,29 @@ class TradeExecutor:
                         order.direction.value, order.price, order.quantity)
         except Exception as e:
             order.status = OrderStatus.JUNK
+            order.status_msg = str(e or "")
             self._order_mgr.register_order(order)
             logger.error("TradeExecutor: 下单失败 uuid=%s: %s",
                          order.order_uuid[:8], e, exc_info=True)
         return order
+
+    @staticmethod
+    def _build_market_order(strategy_id: str, strategy_name: str,
+                            stock_code: str, direction: OrderDirection,
+                            quantity: int, requested_price_type: int,
+                            remark: str) -> Order:
+        """构造统一的吃单类委托对象。"""
+        return Order(
+            strategy_id=strategy_id,
+            strategy_name=strategy_name,
+            stock_code=stock_code,
+            direction=direction,
+            order_type=OrderType.MARKET,
+            price=0.0,
+            quantity=quantity,
+            price_type=requested_price_type,
+            remark=remark,
+        )
 
     @staticmethod
     def _calc_quantity(amount: float, price: float) -> int:
@@ -321,6 +389,75 @@ class TradeExecutor:
 
         # 找不到任何市价常量时，退回限价，至少保证接口还能正常调用。
         return xtconstant.FIX_PRICE
+
+    @staticmethod
+    def _resolve_latest_price_type() -> int:
+        """返回最新价下单的 xtquant 报价类型。"""
+        return getattr(xtconstant, "LATEST_PRICE", xtconstant.FIX_PRICE)
+
+    @classmethod
+    def _resolve_best5_or_cancel_price_type(cls, stock_code: str) -> int:
+        """返回最优五档即时成交剩余撤销的报价类型。"""
+        xt_code = cls._code_to_xt(stock_code)
+        if xt_code.endswith(".SH"):
+            candidates = (
+                "MARKET_SH_CONVERT_5_CANCEL",
+                "MARKET_SH_INSTANT",
+                "MARKET_SH_CONVERT_5_LIMIT",
+                "MARKET_CONVERT_5",
+            )
+        else:
+            candidates = (
+                "MARKET_SZ_CONVERT_5_CANCEL",
+                "MARKET_SZ_INSTBUSI_RESTCANCEL",
+                "MARKET_SZ_CONVERT",
+                "MARKET_CONVERT_5",
+            )
+
+        for name in candidates:
+            value = getattr(xtconstant, name, None)
+            if value is not None:
+                return value
+        return xtconstant.FIX_PRICE
+
+    @classmethod
+    def _resolve_order_price_type(cls, order: Order) -> int:
+        """统一解析订单应使用的报价类型。"""
+        if order.order_type in (OrderType.LIMIT, OrderType.BY_AMOUNT, OrderType.BY_QUANTITY):
+            return xtconstant.FIX_PRICE
+        if order.price_type:
+            return int(order.price_type)
+        return cls._resolve_latest_price_type()
+
+    @staticmethod
+    def _price_tick(stock_code: str) -> Decimal:
+        """返回证券对应的最小报价单位。
+
+        规则说明：
+        - 普通 A 股（0/3/6 开头）按 0.01 元报价。
+        - ETF/LOF/场内基金（常见 1/5 开头）按 0.001 元报价。
+        """
+        code = str(stock_code or "").strip().zfill(6)
+        if code.startswith(("1", "5")):
+            return Decimal("0.001")
+        return Decimal("0.01")
+
+    @classmethod
+    def _normalize_limit_price(cls, stock_code: str, direction: OrderDirection, price: float) -> float:
+        """把限价单价格规整到合法的最小价差。
+
+        - 买单向上取整，提高成交概率。
+        - 卖单向下取整，提高成交概率。
+        """
+        if price <= 0:
+            return 0.0
+
+        tick = cls._price_tick(stock_code)
+        decimal_price = Decimal(str(price))
+        units = decimal_price / tick
+        rounding = ROUND_CEILING if direction == OrderDirection.BUY else ROUND_FLOOR
+        normalized = units.to_integral_value(rounding=rounding) * tick
+        return float(normalized)
 
     @staticmethod
     def _code_to_xt(code: str) -> str:

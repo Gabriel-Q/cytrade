@@ -5,7 +5,7 @@
 - 前端开发者知道可以稳定依赖哪些字段
 - FastAPI 可以自动生成接口文档
 """
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 try:
     from pydantic import BaseModel
@@ -18,14 +18,52 @@ class StrategyInfo(BaseModel):
     """策略列表与详情接口使用的统一响应模型。"""
     strategy_id: str               # 策略实例唯一 ID。
     strategy_name: str             # 策略名称。
+    strategy_type: str = ""       # 策略类型/策略类名，不带实例后缀。
     stock_code: str                # 当前策略负责的标的代码。
+    stock_name: str = ""          # 标的名称。
     status: str                    # 内部策略状态值。
     status_text: str               # 面向前端展示的状态文本。
+    pause_reason: str = ""        # 当前暂停原因；运行中时通常为空。
     unrealized_pnl: float = 0.0    # 浮动盈亏。
     realized_pnl: float = 0.0      # 已实现盈亏。
     total_quantity: int = 0        # 当前总持仓股数。
     avg_cost: float = 0.0          # 平均持仓成本。
     current_price: float = 0.0     # 最新价格。
+    create_time: str = ""         # 策略实例创建时间。
+    capacity: Dict[str, Any] = {}   # 策略总标的名额配置与当前占用状态。
+
+
+class StrategyCapacityWaitingItem(BaseModel):
+    """容量排队中的单个策略实例摘要。"""
+    strategy_id: str
+    strategy_name: str
+    stock_code: str
+    stock_name: str = ""
+
+
+class StrategyCapacityGroup(BaseModel):
+    """按策略类型聚合后的容量概览。"""
+    strategy_type: str
+    instance_count: int = 0
+    used: int = 0
+    limit: int = 0
+    remaining: int = 0
+    occupying_count: int = 0
+    waiting_count: int = 0
+    waiting_items: List[StrategyCapacityWaitingItem] = []
+
+
+class PausedStrategyReconciliation(BaseModel):
+    """暂停策略的策略仓位与账户仓位对账视图。"""
+    strategy_id: str
+    strategy_name: str
+    stock_code: str
+    stock_name: str = ""
+    pause_reason: str = ""
+    strategy_total_quantity: int = 0
+    strategy_available_quantity: int = 0
+    account_total_quantity: int = 0
+    account_available_quantity: int = 0
 
 
 class PositionDetail(BaseModel):
@@ -33,6 +71,7 @@ class PositionDetail(BaseModel):
     strategy_id: str                    # 所属策略 ID。
     strategy_name: str                  # 所属策略名称。
     stock_code: str                     # 标的代码。
+    stock_name: str = ""               # 标的名称。
     total_quantity: int                 # 总持仓数量。
     available_quantity: int             # 当前可卖数量。
     is_t0: bool = False                 # 是否按 T+0 规则处理。
@@ -74,6 +113,7 @@ class OrderInfo(BaseModel):
     strategy_id: str                      # 所属策略 ID。
     strategy_name: str                    # 所属策略名称。
     stock_code: str                       # 内部证券代码。
+    stock_name: str = ""                # 证券名称统一字段。
     xt_stock_code: str = ""              # Xt 原始证券代码。
     direction: str                        # 内部买卖方向值。
     direction_text: str                   # 展示用方向文本。
@@ -85,6 +125,7 @@ class OrderInfo(BaseModel):
     quantity: int                         # 委托数量。
     status: str                           # 内部订单状态值。
     status_text: str                      # 展示用订单状态文本。
+    cancellable: bool = False             # 当前是否支持直接发起撤单。
     xt_order_status: int = 0              # Xt 原始状态码。
     status_msg: str = ""                 # 状态说明或失败原因。
     order_sysid: str = ""                # 柜台合同编号。
@@ -119,6 +160,7 @@ class TradeInfo(BaseModel):
     strategy_id: str                      # 所属策略 ID。
     strategy_name: str                    # 所属策略名称。
     stock_code: str                       # 标的代码。
+    stock_name: str = ""                # 标的名称。
 
     account_type: int                     # 账号类型。
     account_id: str                       # 资金账号。
@@ -143,12 +185,48 @@ class TradeInfo(BaseModel):
     trade_time: str                       # 标准化成交时间字符串。
 
 
+class StrategyPositionReplayStep(BaseModel):
+    """单笔成交回放后的策略仓位快照。"""
+    trade_id: str
+    trade_time: str = ""
+    trade_day: str = ""
+    direction: str
+    direction_text: str
+    price: float
+    quantity: int
+    amount: float
+    order_remark: str = ""
+    total_quantity: int = 0
+    available_quantity: int = 0
+    avg_cost: float = 0.0
+    realized_pnl: float = 0.0
+    total_commission: float = 0.0
+
+
+class StrategyPositionReplay(BaseModel):
+    """按成交回放得到的策略仓位诊断结果。"""
+    strategy_id: str
+    strategy_name: str
+    stock_code: str
+    stock_name: str = ""
+    step_count: int = 0
+    final_total_quantity: int = 0
+    final_available_quantity: int = 0
+    live_total_quantity: int = 0
+    live_available_quantity: int = 0
+    steps: List[StrategyPositionReplayStep] = []
+
+
 class SystemStatus(BaseModel):
     """系统状态面板使用的响应模型。"""
     connected: bool            # 交易连接是否可用。
     trading_time: bool         # 当前是否处于交易时段。
     strategy_count: int        # 当前策略数量。
     active_orders: int         # 当前活跃订单数。
+    latest_data_time: str = ""   # 最新一笔行情的源时间。
+    data_delay_ms: float = 0.0  # 最新一笔行情的延迟毫秒数。
+    strategy_process_total_ms: float = 0.0  # 最近一轮行情推送的策略总处理耗时。
+    data_latency_threshold_sec: float = 0.0  # 延迟阈值（秒），供前端判断展示状态。
     cpu_pct: float = 0.0       # CPU 使用率。
     mem_pct: float = 0.0       # 内存使用率。
     timestamp: str             # 响应生成时间。
@@ -161,6 +239,8 @@ class ActionResponse(BaseModel):
 
 
 __all__ = [
-    "StrategyInfo", "PositionDetail", "PositionSummary",
-    "OrderInfo", "TradeInfo", "SystemStatus", "ActionResponse",
+    "StrategyInfo", "PausedStrategyReconciliation", "PositionDetail", "PositionSummary",
+    "OrderInfo", "TradeInfo", "StrategyPositionReplayStep", "StrategyPositionReplay",
+    "StrategyCapacityWaitingItem", "StrategyCapacityGroup",
+    "SystemStatus", "ActionResponse",
 ]

@@ -10,12 +10,15 @@
 """
 import uuid
 import threading
+import weakref
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from config.enums import StrategyStatus
+from config.enums import OrderDirection, OrderStatus, StrategyStatus
 from core.models import TickData
+from position.models import PositionInfo
 from strategy.models import StrategyConfig, StrategySnapshot
 from trading.models import Order
 from monitor.logger import get_logger
@@ -47,6 +50,7 @@ class BaseStrategy(ABC):
     strategy_name: str = "BaseStrategy"
     max_positions: int = 5
     max_total_amount: float = 100000.0
+    state_version: int = 1
 
     # ---- 类级别共享统计（需子类自行维护 thread safety 如有需要） ----
     current_positions: int = 0
@@ -76,15 +80,43 @@ class BaseStrategy(ABC):
         self._trade_executor = trade_executor
         # ``_position_mgr`` 用于查询当前策略的持仓状态。
         self._position_mgr = position_manager
+        # ``_data_mgr`` 用于运行态持久化和清理，由 Runner 在接管时注入。
+        self._data_mgr = None
+        # ``_state_persist_callback`` 由 Runner 注入，便于策略在关键事件后请求即时持久化。
+        self._state_persist_callback = None
         # ``_pending_orders`` 保存尚未终结的订单对象，便于防重复下单和状态跟踪。
         self._pending_orders: Dict[str, Order] = {}   # {order_uuid: Order}
+        # ``_pending_order_recovery_ids`` 暂存从快照恢复出的活动订单 UUID，
+        # 由 Runner 在启动时统一从 SQLite 重建真实订单对象。
+        self._pending_order_recovery_ids: List[str] = []
         # ``_create_time`` 记录该策略实例创建时间。
         self._create_time = datetime.now()
         # ``_orders_history`` 保存该策略实例经历过的全部订单历史。
         self._orders_history: List[Order] = []
+        # ``_pause_reason`` 保存最近一次暂停原因，便于 Web/API 展示与恢复。
+        self._pause_reason: str = ""
+        # ``_pending_close_requested`` 表示当前策略还有未完成的跨日平仓请求。
+        self._pending_close_requested: bool = False
+        # ``_pending_close_remark`` 保留触发平仓的原始原因，重启和跨日后继续沿用。
+        self._pending_close_remark: str = ""
+        # ``_last_stop_loss_remark`` / ``_last_stop_loss_value`` 允许子类把更复杂的止损原因回传给统一日志层。
+        self._last_stop_loss_remark: str = "触发止损"
+        self._last_stop_loss_value: float = float(self.config.stop_loss_price or 0.0)
+
+        self._register_instance()
 
         logger.info("Strategy[%s] %s 初始化 stock=%s",
                     self.strategy_id[:8], self.strategy_name, self.stock_code)
+
+    def bind_persistence(self, data_manager=None, persist_callback=None) -> None:
+        """绑定运行态持久化依赖。"""
+        self._data_mgr = data_manager
+        self._state_persist_callback = persist_callback
+
+    def request_state_persist(self, reason: str = "", min_interval_sec: float = 0.0) -> None:
+        """请求 Runner 立即持久化当前运行态。"""
+        if callable(self._state_persist_callback):
+            self._state_persist_callback(reason=reason, min_interval_sec=min_interval_sec)
 
     # ------------------------------------------------------------------ Abstract
 
@@ -131,6 +163,16 @@ class BaseStrategy(ABC):
             if self._position_mgr:
                 self._position_mgr.update_price(self.stock_code, tick.last_price)
 
+            # 若已经有活跃中的卖出单，说明该标的正在退出流程中；
+            # 此时继续重复做止损检查只会产生噪声日志和重复平仓请求。
+            if self._has_active_exit_order():
+                return
+
+            # 若已存在跨交易日待平仓请求，则优先继续执行退出流程，
+            # 防止策略在持仓未清完时重新产生新的开仓/加仓动作。
+            if self._process_pending_close_request():
+                return
+
             # 风控前置检查：先看是否需要立即止损/止盈，只有通过后才交给子类继续生成新信号。
             if self._check_risk(tick):
                 return
@@ -148,6 +190,13 @@ class BaseStrategy(ABC):
                          self.strategy_id[:8], e, exc_info=True)
             self.status = StrategyStatus.ERROR
 
+    def before_process_tick(self, tick: TickData) -> None:
+        """在处理 tick 前执行轻量状态维护。
+
+        子类可覆盖，用于在真正进入 `process_tick()` 前做恢复/清理判断。
+        """
+        return None
+
     def _check_risk(self, tick: TickData) -> bool:
         """执行通用风控检查。
 
@@ -156,10 +205,16 @@ class BaseStrategy(ABC):
         """
         # 止损优先级高于止盈，先检查下行风险。
         if self.check_stop_loss(tick):
-            logger.warning("Strategy[%s] 触发止损 price=%.3f stop=%.3f",
-                           self.strategy_id[:8], tick.last_price,
-                           self.config.stop_loss_price)
-            self.close_position(remark="触发止损")
+            stop_remark = self._get_stop_loss_remark(tick)
+            stop_value = self._get_stop_loss_log_value(tick)
+            if stop_value > 0:
+                logger.warning("Strategy[%s] %s price=%.3f stop=%.3f",
+                               self.strategy_id[:8], stop_remark, tick.last_price,
+                               stop_value)
+            else:
+                logger.warning("Strategy[%s] %s price=%.3f",
+                               self.strategy_id[:8], stop_remark, tick.last_price)
+            self._handle_stop_loss_exit(tick, stop_remark)
             return True
         if self.check_take_profit(tick):
             logger.info("Strategy[%s] 触发止盈 price=%.3f tp=%.3f",
@@ -194,6 +249,31 @@ class BaseStrategy(ABC):
                 self.reduce_position(price, quantity, remark)
         elif action == "CLOSE":
             self.close_position(remark)
+
+    @staticmethod
+    def _is_insufficient_funds_message(message: str) -> bool:
+        """判断失败原因是否属于账户资金不足。"""
+        text = str(message or "").strip()
+        if not text:
+            return False
+        keywords = (
+            "资金不足",
+            "可用资金不足",
+            "可用金额不足",
+            "余额不足",
+            "现金不足",
+            "insufficient funds",
+            "insufficient cash",
+        )
+        lowered = text.lower()
+        return any(keyword in text or keyword in lowered for keyword in keywords)
+
+    def _pause_for_order_rejection(self, reason: str) -> None:
+        """在关键下单失败时暂停策略，并持久化暂停原因。"""
+        pause_reason = str(reason or "下单失败")
+        logger.warning("Strategy[%s] 因下单失败自动暂停: %s", self.strategy_id[:8], pause_reason)
+        self.pause(reason=pause_reason)
+        self.request_state_persist(reason=f"order_rejection_pause:{self.strategy_id}")
 
     # ------------------------------------------------------------------ 仓位操作
 
@@ -270,10 +350,37 @@ class BaseStrategy(ABC):
         """提交清仓请求。"""
         if not self._trade_executor:
             return None
+
+        position = self._position_mgr.get_position(self.strategy_id) if self._position_mgr else None
+        total_quantity = int(getattr(position, "total_quantity", 0) or 0)
+        available_quantity = int(getattr(position, "available_quantity", 0) or 0)
+        close_remark = remark or "策略平仓"
+
+        if total_quantity <= 0:
+            self._clear_pending_close_request()
+            return None
+
+        if total_quantity > available_quantity:
+            self._set_pending_close_request(close_remark)
+
+        if available_quantity <= 0:
+            logger.info(
+                "Strategy[%s] 平仓请求已登记，当前无可用持仓，等待下一交易日解锁后继续平仓 code=%s total=%d available=%d reason=%s",
+                self.strategy_id[:8],
+                self.stock_code,
+                total_quantity,
+                available_quantity,
+                close_remark,
+            )
+            return None
+
+        if total_quantity <= available_quantity:
+            self._clear_pending_close_request()
+
         # close_position 表示“把当前策略实例对应仓位全部平掉”，由执行器内部决定具体可卖数量。
         order = self._trade_executor.close_position(
             self.strategy_id, self.strategy_name,
-            self.stock_code, remark=remark or "策略平仓"
+            self.stock_code, remark=close_remark
         )
         self._track_order(order)
         # 平仓成交后同步类属性
@@ -302,6 +409,78 @@ class BaseStrategy(ABC):
             return False
         return tick.last_price >= self.config.take_profit_price
 
+    def _get_stop_loss_remark(self, tick: TickData) -> str:
+        """返回当前止损触发时用于日志和平仓备注的文案。"""
+        return self._last_stop_loss_remark or "触发止损"
+
+    def _get_stop_loss_log_value(self, tick: TickData) -> float:
+        """返回当前止损日志中应显示的阈值。"""
+        value = float(self._last_stop_loss_value or 0.0)
+        if value > 0:
+            return value
+        return float(self.config.stop_loss_price or 0.0)
+
+    def _handle_stop_loss_exit(self, tick: TickData, remark: str) -> Optional[Order]:
+        """止损触发时，先撤未完成买单，再按最新价提交卖单。"""
+        canceled_count = self._cancel_active_buy_orders(remark=f"{remark} 前撤销未完成买单")
+        if canceled_count > 0:
+            logger.info("Strategy[%s] 止损前撤销 %d 笔未完成买单",
+                        self.strategy_id[:8], canceled_count)
+        return self._submit_stop_loss_order(tick, remark)
+
+    def _cancel_active_buy_orders(self, remark: str = "") -> int:
+        """撤销当前策略仍处于活动态的买单。"""
+        if not self._trade_executor:
+            return 0
+
+        canceled_count = 0
+        cancel_order = getattr(self._trade_executor, "cancel_order", None)
+        if not callable(cancel_order):
+            return 0
+
+        for order_uuid, order in list(self._pending_orders.items()):
+            if order.direction != OrderDirection.BUY or not order.is_active():
+                continue
+            canceled = bool(cancel_order(order_uuid, remark=remark or "止损前撤单"))
+            if not canceled:
+                logger.warning("Strategy[%s] 止损前撤买单失败 uuid=%s",
+                               self.strategy_id[:8], order_uuid[:8])
+                continue
+            order.status = OrderStatus.CANCELED
+            self._pending_orders.pop(order_uuid, None)
+            canceled_count += 1
+        return canceled_count
+
+    def _submit_stop_loss_order(self, tick: TickData, remark: str) -> Optional[Order]:
+        """用最新价模式提交止损卖单；不可用时退回普通平仓。
+
+        当前模拟盘阶段，交易执行器内部已经把 ``sell_market`` 统一收敛到
+        ``sell_latest``，这样止损与主动平仓都走同一套最新价口径。
+        """
+        if not self._trade_executor or not self._position_mgr:
+            return self.close_position(remark=remark)
+
+        position = self._position_mgr.get_position(self.strategy_id)
+        available_quantity = int(getattr(position, "available_quantity", 0) or 0)
+
+        if available_quantity <= 0:
+            return self.close_position(remark=remark)
+
+        order = self._trade_executor.sell_market(
+            self.strategy_id,
+            self.strategy_name,
+            self.stock_code,
+            available_quantity,
+            remark,
+        )
+        self._track_order(order)
+        self.__class__._sync_class_stats(self._position_mgr)
+        return order
+
+    def _has_active_exit_order(self) -> bool:
+        """判断当前策略是否已经存在活跃中的卖出/平仓订单。"""
+        return any(order.direction == OrderDirection.SELL and order.is_active() for order in self._pending_orders.values())
+
     # ------------------------------------------------------------------ 控制
 
     def start(self) -> None:
@@ -309,20 +488,154 @@ class BaseStrategy(ABC):
         self.status = StrategyStatus.RUNNING
         logger.info("Strategy[%s] %s 启动", self.strategy_id[:8], self.strategy_name)
 
-    def pause(self) -> None:
+    def prepare_for_trading_day(self, trade_day: str) -> bool:
+        """为交易日启动做预初始化。
+
+        默认实现什么都不做，返回 ``True`` 表示准备成功。
+        具体策略可覆盖该钩子，把原本首个 tick 才执行的重初始化前移到订阅前。
+        """
+        return True
+
+    def can_recover_from_account_position(self, account_position) -> bool:
+        """判断是否允许用账户真实持仓恢复该策略实例。"""
+        return False
+
+    def suggest_account_recovery_quantity(self, account_position) -> int:
+        """返回该策略期望接管的账户持仓数量。
+
+        返回 ``0`` 表示交由运行器按默认分配规则处理。
+        """
+        return 0
+
+    def on_account_position_recovered(self, position: PositionInfo, trade_day: str) -> None:
+        """账户持仓恢复成功后的策略级回调。"""
+        pass
+
+    def pause(self, reason: str = "") -> None:
         """把策略状态切换为暂停。"""
         self.status = StrategyStatus.PAUSED
-        logger.info("Strategy[%s] 暂停", self.strategy_id[:8])
+        self._pause_reason = str(reason or self._pause_reason or "")
+        if self._pause_reason:
+            logger.info("Strategy[%s] 暂停: %s", self.strategy_id[:8], self._pause_reason)
+        else:
+            logger.info("Strategy[%s] 暂停", self.strategy_id[:8])
 
     def resume(self) -> None:
         """恢复策略运行。"""
         self.status = StrategyStatus.RUNNING
+        self._pause_reason = ""
         logger.info("Strategy[%s] 恢复", self.strategy_id[:8])
 
     def stop(self) -> None:
         """停止策略运行。"""
         self.status = StrategyStatus.STOPPED
+        self._clear_pending_close_request()
         logger.info("Strategy[%s] 停止", self.strategy_id[:8])
+
+    def get_pause_reason(self) -> str:
+        """返回最近一次暂停原因。"""
+        return str(self._pause_reason or "")
+
+    @classmethod
+    def uses_position_slot_management(cls) -> bool:
+        """是否启用“总持仓标的名额”通用能力。"""
+        return False
+
+    @classmethod
+    def capacity_wait_pause_reason(cls) -> str:
+        """等待空余名额时使用的统一暂停原因。"""
+        return f"{cls.strategy_name} 等待空余名额"
+
+    @classmethod
+    def capacity_config(cls) -> dict:
+        """返回当前策略类的总标的名额配置。"""
+        enabled = bool(cls.uses_position_slot_management())
+        return {
+            "enabled": enabled,
+            "limit": int(cls.max_positions if enabled else 0),
+            "wait_reason": cls.capacity_wait_pause_reason() if enabled else "",
+        }
+
+    @classmethod
+    def persistent_class_fields(cls) -> List[str]:
+        """返回该策略类需要持久化的共享字段列表。"""
+        return []
+
+    def persistent_instance_fields(self) -> List[str]:
+        """返回当前策略实例需要持久化的字段列表。"""
+        return []
+
+    @classmethod
+    def persistent_class_state(cls) -> dict:
+        """导出该策略类需要持久化的共享运行态。"""
+        return cls._export_class_state_fields(cls.persistent_class_fields())
+
+    @classmethod
+    def restore_persistent_class_state(cls, state: dict) -> None:
+        """恢复该策略类的共享运行态。"""
+        cls._restore_class_state_fields(state, cls.persistent_class_fields())
+
+    def persistent_instance_state(self) -> dict:
+        """导出当前策略实例的自定义运行态。"""
+        return self._get_custom_state()
+
+    def restore_persistent_instance_state(self, state: dict) -> None:
+        """恢复当前策略实例的自定义运行态。"""
+        self._restore_custom_state(state)
+
+    def clear_persistent_state(self) -> int:
+        """清除当前策略实例在持久化层中的运行态。"""
+        if not self._data_mgr:
+            return 0
+        return int(self._data_mgr.clear_strategy_runtime_state(self.strategy_id, strategy_type=self.strategy_name) or 0)
+
+    def should_wait_for_position_slot(self) -> bool:
+        """判断当前实例是否应参与名额竞争。"""
+        return False
+
+    def occupies_position_slot(self) -> bool:
+        """判断当前实例是否已占用一个总持仓标的名额。"""
+        return self._has_position_for_slot() or self._has_active_entry_order()
+
+    def has_position_slot_available(self) -> bool:
+        """判断当前策略类是否还有空余总持仓标的名额。"""
+        if not self.__class__.uses_position_slot_management():
+            return True
+        if self.occupies_position_slot():
+            return True
+        self.__class__._sync_class_stats(self._position_mgr)
+        return self.__class__.active_position_slot_count() < self.max_positions
+
+    def is_waiting_for_position_slot(self) -> bool:
+        """判断当前实例是否处于等待空余名额的暂停态。"""
+        return (
+            self.status == StrategyStatus.PAUSED
+            and self.get_pause_reason() == self.__class__.capacity_wait_pause_reason()
+        )
+
+    def pause_for_position_slot(self) -> None:
+        """把当前实例切到等待空余名额的暂停态。"""
+        if self.is_waiting_for_position_slot():
+            return
+        self.pause(reason=self.__class__.capacity_wait_pause_reason())
+
+    def reconcile_position_slot_state(self) -> None:
+        """按当前类级名额占用情况收敛等待/恢复状态。"""
+        if not self.__class__.uses_position_slot_management():
+            return
+        if not self.should_wait_for_position_slot():
+            return
+        if self.status == StrategyStatus.STOPPED:
+            return
+        if self.occupies_position_slot():
+            if self.is_waiting_for_position_slot():
+                self.resume()
+            return
+        if self.has_position_slot_available():
+            if self.is_waiting_for_position_slot():
+                self.resume()
+            return
+        self.pause_for_position_slot()
 
     # ------------------------------------------------------------------ 订单回调
 
@@ -344,6 +657,28 @@ class BaseStrategy(ABC):
                                     OrderStatus.UNKNOWN):
                     self._pending_orders.pop(order.order_uuid, None)
 
+            if (
+                order.direction == OrderDirection.SELL
+                and order.status == OrderStatus.JUNK
+                and "可用数量不足" in str(getattr(order, "status_msg", "") or "")
+            ):
+                logger.warning(
+                    "Strategy[%s] 卖单被拒，检测到账户可用仓位不足，自动暂停策略 code=%s msg=%s",
+                    self.strategy_id[:8],
+                    self.stock_code,
+                    getattr(order, "status_msg", ""),
+                )
+                self.pause(reason=str(getattr(order, "status_msg", "") or "账户可用数量不足"))
+
+            if (
+                order.direction == OrderDirection.BUY
+                and order.status == OrderStatus.JUNK
+                and self._is_insufficient_funds_message(str(getattr(order, "status_msg", "") or ""))
+            ):
+                self._pause_for_order_rejection(
+                    str(getattr(order, "status_msg", "") or "账户资金不足，买入失败")
+                )
+
                 # 卖出订单全部成交后，如果该策略已经没有持仓，
                 # 则自动将策略标记为停止状态。
             if (order.direction == OrderDirection.SELL and
@@ -351,6 +686,7 @@ class BaseStrategy(ABC):
                     self._position_mgr):
                 pos = self._position_mgr.get_position(self.strategy_id)
                 if not pos or pos.total_quantity <= 0:
+                    self._clear_pending_close_request()
                     self.stop()
 
             # 类级统计和子类扩展钩子都放在订单回报阶段更新，保证与真实成交状态一致。
@@ -382,9 +718,24 @@ class BaseStrategy(ABC):
             config=self.config,
             position=pos or PositionInfo(),
             pending_order_uuids=list(self._pending_orders.keys()),
-            custom_state=self._get_custom_state(),
+            pause_reason=self.get_pause_reason(),
+            pending_close_requested=bool(self._pending_close_requested),
+            pending_close_remark=str(self._pending_close_remark or ""),
+            custom_state=self.persistent_instance_state(),
+            create_time=self._create_time if isinstance(self._create_time, datetime) else datetime.now(),
             update_time=datetime.now(),
         )
+
+    def prepare_for_persist(self) -> None:
+        """在保存快照前执行状态收敛。
+
+        子类可覆盖，用于在持久化前补做跨时点清理动作。
+        """
+        return None
+
+    def should_persist_state(self) -> bool:
+        """判断当前策略是否应进入本轮快照。"""
+        return self.status != StrategyStatus.STOPPED
 
     def restore_from_snapshot(self, snapshot: StrategySnapshot) -> None:
         """从历史快照恢复策略状态。"""
@@ -393,34 +744,188 @@ class BaseStrategy(ABC):
         self.stock_code = snapshot.stock_code
         self.status = snapshot.status
         self.config = snapshot.config
+        self._pending_order_recovery_ids = list(snapshot.pending_order_uuids or [])
+        self._pause_reason = str(getattr(snapshot, "pause_reason", "") or "")
+        self._pending_close_requested = bool(getattr(snapshot, "pending_close_requested", False))
+        self._pending_close_remark = str(getattr(snapshot, "pending_close_remark", "") or "")
         
         # 持仓恢复与策略对象恢复分开进行，
         # 这样持仓管理器仍然是唯一的持仓状态维护中心。
-        if self._position_mgr and snapshot.position:
+        if (
+            self._position_mgr and
+            snapshot.position and
+            int(getattr(snapshot.position, "total_quantity", 0) or 0) > 0
+        ):
+            if not str(getattr(snapshot.position, "strategy_id", "") or "").strip():
+                snapshot.position.strategy_id = self.strategy_id
+            if not str(getattr(snapshot.position, "strategy_name", "") or "").strip():
+                snapshot.position.strategy_name = self.strategy_name
+            if not str(getattr(snapshot.position, "stock_code", "") or "").strip():
+                snapshot.position.stock_code = self.stock_code
             # 使用 restore_position 方法，内部自动处理加锁和 T+1 解锁
             self._position_mgr.restore_position(self.strategy_id, snapshot.position)
             self.__class__._sync_class_stats(self._position_mgr)
-            
-        self._restore_custom_state(snapshot.custom_state)
+
+        self.restore_persistent_instance_state(snapshot.custom_state)
+        snapshot_create_time = getattr(snapshot, "create_time", None)
+        if isinstance(snapshot_create_time, datetime):
+            self._create_time = snapshot_create_time
         logger.info("Strategy[%s] 从快照恢复 stock=%s status=%s",
                     self.strategy_id[:8], self.stock_code, self.status.value)
 
+    def get_pending_order_recovery_ids(self) -> List[str]:
+        """返回待重建的活动订单 UUID 列表。"""
+        return list(self._pending_order_recovery_ids)
+
+    def restore_pending_orders(self, orders: List[Order]) -> None:
+        """把已持久化的活动订单重新挂回当前策略实例。"""
+        self._pending_orders.clear()
+        restored_history_ids = {order.order_uuid for order in self._orders_history}
+        for order in orders:
+            if order.strategy_id != self.strategy_id or not order.is_active():
+                continue
+            self._pending_orders[order.order_uuid] = order
+            if order.order_uuid not in restored_history_ids:
+                self._orders_history.append(order)
+        self._pending_order_recovery_ids = []
+
     def _get_custom_state(self) -> dict:
         """子类覆盖，返回需持久化的额外状态"""
-        return {}
+        return self._export_state_fields(self.persistent_instance_fields())
 
     def _restore_custom_state(self, state: dict) -> None:
         """子类覆盖，恢复额外状态"""
-        pass
+        self._restore_state_fields(state, self.persistent_instance_fields())
+
+    def _export_state_fields(self, fields: List[str]) -> Dict[str, Any]:
+        """按字段清单导出实例运行态。"""
+        state: Dict[str, Any] = {}
+        for field_name in fields or []:
+            if not hasattr(self, field_name):
+                continue
+            state[field_name] = deepcopy(getattr(self, field_name))
+        return state
+
+    def _restore_state_fields(self, state: dict, fields: List[str]) -> None:
+        """按字段清单恢复实例运行态。"""
+        for field_name in fields or []:
+            if field_name not in state:
+                continue
+            setattr(self, field_name, deepcopy(state.get(field_name)))
+
+    @classmethod
+    def _export_class_state_fields(cls, fields: List[str]) -> Dict[str, Any]:
+        """按字段清单导出类共享运行态。"""
+        state: Dict[str, Any] = {}
+        for field_name in fields or []:
+            if not hasattr(cls, field_name):
+                continue
+            state[field_name] = deepcopy(getattr(cls, field_name))
+        return state
+
+    @classmethod
+    def _restore_class_state_fields(cls, state: dict, fields: List[str]) -> None:
+        """按字段清单恢复类共享运行态。"""
+        for field_name in fields or []:
+            if field_name not in state:
+                continue
+            setattr(cls, field_name, deepcopy(state.get(field_name)))
 
     # ------------------------------------------------------------------ Private
 
     def _track_order(self, order: Order) -> None:
         """把订单记录到待处理列表和历史列表。"""
+        if not order:
+            return
         # 活跃订单进入 pending；无论是否活跃，都保留一份历史，便于审计和排查。
         if order and order.is_active():
             self._pending_orders[order.order_uuid] = order
         self._orders_history.append(order)
+        if order.status in (OrderStatus.JUNK, OrderStatus.UNKNOWN, OrderStatus.CANCELED, OrderStatus.PART_CANCEL):
+            self.on_order_update(order)
+
+    def _set_pending_close_request(self, remark: str = "") -> None:
+        """登记跨交易日待平仓请求。"""
+        self._pending_close_requested = True
+        self._pending_close_remark = str(remark or self._pending_close_remark or "策略平仓")
+
+    def _clear_pending_close_request(self) -> None:
+        """清除已完成的待平仓请求。"""
+        self._pending_close_requested = False
+        self._pending_close_remark = ""
+
+    def _process_pending_close_request(self) -> bool:
+        """若存在跨交易日待平仓请求，则优先尝试继续卖出当前可用仓位。"""
+        if not self._pending_close_requested:
+            return False
+        if not self._position_mgr:
+            return True
+
+        position = self._position_mgr.get_position(self.strategy_id)
+        total_quantity = int(getattr(position, "total_quantity", 0) or 0)
+        available_quantity = int(getattr(position, "available_quantity", 0) or 0)
+
+        if total_quantity <= 0:
+            self._clear_pending_close_request()
+            self.stop()
+            return True
+
+        if available_quantity <= 0:
+            return True
+
+        logger.info(
+            "Strategy[%s] 检测到待平仓请求，继续卖出当前可用仓位 code=%s total=%d available=%d reason=%s",
+            self.strategy_id[:8],
+            self.stock_code,
+            total_quantity,
+            available_quantity,
+            self._pending_close_remark or "策略平仓",
+        )
+        self.close_position(remark=self._pending_close_remark or "策略平仓")
+        return True
+
+    def _has_position_for_slot(self) -> bool:
+        """判断当前实例是否已有真实持仓，可用于名额占用统计。"""
+        if not self._position_mgr:
+            return False
+        position = self._position_mgr.get_position(self.strategy_id)
+        return bool(position and int(getattr(position, "total_quantity", 0) or 0) > 0)
+
+    def _has_active_entry_order(self) -> bool:
+        """判断当前实例是否存在尚未终结的买入单。"""
+        return any(
+            order.direction == OrderDirection.BUY and order.is_active()
+            for order in self._pending_orders.values()
+        )
+
+    def _register_instance(self) -> None:
+        """把当前实例注册到策略类级别的活动实例表。"""
+        self.__class__._ensure_instance_registry()
+        with self.__class__._instance_lock:
+            self.__class__._live_instances[self.strategy_id] = self
+
+    @classmethod
+    def _ensure_instance_registry(cls) -> None:
+        """确保每个具体策略子类都有独立的活动实例表。"""
+        if "_instance_lock" not in cls.__dict__:
+            cls._instance_lock = threading.Lock()
+        if "_live_instances" not in cls.__dict__:
+            cls._live_instances = weakref.WeakValueDictionary()
+
+    @classmethod
+    def active_position_slot_count(cls) -> int:
+        """统计当前策略类已经占用的总持仓标的名额数。"""
+        cls._ensure_instance_registry()
+        with cls._instance_lock:
+            live_instances = list(cls._live_instances.values())
+
+        active_strategy_ids = set()
+        for instance in live_instances:
+            if instance.status == StrategyStatus.STOPPED:
+                continue
+            if instance.occupies_position_slot():
+                active_strategy_ids.add(instance.strategy_id)
+        return len(active_strategy_ids)
 
     @classmethod
     def _sync_class_stats(cls, position_manager=None) -> None:

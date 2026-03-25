@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from backtest.models import BacktestResult
@@ -23,9 +24,11 @@ class BacktestReportBuilder:
     _METRIC_GROUPS = {
         "收益指标": [
             "starting_equity",
+            "ending_nav",
             "ending_equity",
             "total_return",
             "annualized_return",
+            "annualized_volatility",
             "total_realized_pnl",
             "avg_daily_return",
             "best_day_return",
@@ -33,13 +36,17 @@ class BacktestReportBuilder:
         ],
         "风险指标": [
             "max_drawdown",
+            "max_drawdown_duration",
             "sharpe",
+            "sortino",
+            "calmar",
             "daily_win_rate",
             "trading_days",
         ],
         "交易指标": [
             "trade_count",
             "order_count",
+            "total_trades",
             "closed_trade_count",
             "winning_trade_count",
             "losing_trade_count",
@@ -50,23 +57,38 @@ class BacktestReportBuilder:
             "profit_factor",
             "total_fee",
         ],
+        "基准对比": [
+            "benchmark_total_return",
+            "benchmark_annualized_return",
+            "excess_return",
+            "alpha",
+            "beta",
+            "tracking_error",
+            "information_ratio",
+        ],
     }
 
     _METRIC_LABELS = {
-        "starting_equity": "初始净值",
-        "ending_equity": "期末净值",
+        "starting_equity": "初始总资产",
+        "ending_nav": "期末净值",
+        "ending_equity": "期末总资产",
         "total_return": "总收益率",
         "annualized_return": "年化收益率",
+        "annualized_volatility": "年化波动率",
         "total_realized_pnl": "已实现盈亏",
         "avg_daily_return": "平均逐日收益",
         "best_day_return": "最佳单日收益",
         "worst_day_return": "最差单日收益",
         "max_drawdown": "最大回撤",
+        "max_drawdown_duration": "最大回撤期(天)",
         "sharpe": "夏普比率",
+        "sortino": "索提诺比率",
+        "calmar": "卡玛比率",
         "daily_win_rate": "按日胜率",
         "trading_days": "交易日数",
         "trade_count": "成交笔数",
         "order_count": "订单记录数",
+        "total_trades": "总交易次数",
         "closed_trade_count": "闭合交易数",
         "winning_trade_count": "盈利交易数",
         "losing_trade_count": "亏损交易数",
@@ -76,18 +98,26 @@ class BacktestReportBuilder:
         "profit_loss_ratio": "盈亏比",
         "profit_factor": "Profit Factor",
         "total_fee": "总费用",
+        "benchmark_total_return": "基准累计收益率",
+        "benchmark_annualized_return": "基准年化收益率",
+        "excess_return": "超额收益",
+        "alpha": "Alpha",
+        "beta": "Beta",
+        "tracking_error": "跟踪误差",
+        "information_ratio": "信息比率",
     }
 
     def build_html(self, result: BacktestResult) -> str:
         """把回测结果转成 HTML 文本。"""
         metrics_tables = self._build_metric_tables(result.metrics)
+        daily_equity_points = self._build_daily_equity_points(result)
         equity_points = [
             {
-                "time": point.data_time.isoformat(),
-                "equity": point.equity,
-                "drawdown": point.drawdown,
+                "time": point["data_time"].isoformat(),
+                "equity": point["equity"],
+                "drawdown": point["drawdown"],
             }
-            for point in result.equity_curve
+            for point in daily_equity_points
         ]
         daily_return_points = [
             {
@@ -96,6 +126,14 @@ class BacktestReportBuilder:
                 "daily_return": item.daily_return,
             }
             for item in result.daily_returns
+        ]
+        benchmark_daily_return_points = [
+            {
+                "trade_day": item.trade_day,
+                "equity": item.equity,
+                "daily_return": item.daily_return,
+            }
+            for item in result.benchmark_daily_returns
         ]
         order_rows = "".join(
             "<tr>"
@@ -169,7 +207,9 @@ class BacktestReportBuilder:
         <tr><th>开始日期</th><td>{result.config.start_date}</td></tr>
         <tr><th>结束日期</th><td>{result.config.end_date}</td></tr>
         <tr><th>周期</th><td>{result.config.period}</td></tr>
-        <tr><th>初始资金</th><td>{result.config.initial_cash:.2f}</td></tr>
+        <tr><th>账户初始资金</th><td>{result.config.initial_cash:.2f}</td></tr>
+        <tr><th>收益基准资金</th><td>{float(getattr(result.config, 'performance_base_equity', 0.0) or result.config.initial_cash):.2f}</td></tr>
+        <tr><th>基准代码</th><td>{result.config.benchmark_code or '-'}</td></tr>
         <tr><th>滑点</th><td>{result.config.slippage:.4f}</td></tr>
     </table>
     <h2>指标</h2>
@@ -203,12 +243,19 @@ class BacktestReportBuilder:
     <script>
         const equityPoints = {json.dumps(equity_points, ensure_ascii=False)};
         const dailyReturns = {json.dumps(daily_return_points, ensure_ascii=False)};
+        const benchmarkDailyReturns = {json.dumps(benchmark_daily_return_points, ensure_ascii=False)};
         Plotly.newPlot('equity', [{{
             x: equityPoints.map(item => item.time),
             y: equityPoints.map(item => item.equity),
             type: 'scatter',
             mode: 'lines',
             name: '净值'
+        }}, {{
+            x: benchmarkDailyReturns.map(item => item.trade_day),
+            y: benchmarkDailyReturns.map(item => item.equity),
+            type: 'scatter',
+            mode: 'lines',
+            name: '基准'
         }}], {{ title: '净值曲线' }});
         Plotly.newPlot('drawdown', [{{
             x: equityPoints.map(item => item.time),
@@ -245,8 +292,48 @@ class BacktestReportBuilder:
         return "".join(cards)
 
     @staticmethod
+    def _build_daily_equity_points(result: BacktestResult) -> list:
+        """把净值曲线收敛为按天的尾点，用于报表绘图。"""
+        if result.daily_returns:
+            peak = 0.0
+            daily_points = []
+            for item in result.daily_returns:
+                peak = max(peak, item.equity)
+                drawdown = 0.0 if peak <= 0 else (peak - item.equity) / peak
+                daily_points.append(
+                    {
+                        "data_time": datetime.fromisoformat(f"{item.trade_day}T15:00:00"),
+                        "equity": item.equity,
+                        "drawdown": drawdown,
+                    }
+                )
+            return daily_points
+
+        last_point_by_day = {}
+        for point in result.equity_curve:
+            trade_day = point.data_time.strftime("%Y-%m-%d")
+            last_point_by_day[trade_day] = point
+
+        peak = 0.0
+        daily_points = []
+        for trade_day in sorted(last_point_by_day.keys()):
+            point = last_point_by_day[trade_day]
+            peak = max(peak, point.equity)
+            drawdown = 0.0 if peak <= 0 else (peak - point.equity) / peak
+            daily_points.append(
+                {
+                    "data_time": point.data_time,
+                    "equity": point.equity,
+                    "drawdown": drawdown,
+                }
+            )
+        return daily_points
+
+    @staticmethod
     def _format_metric_value(value) -> str:
         """统一格式化数值指标，便于报表阅读。"""
+        if value is None:
+            return "-"
         if isinstance(value, float):
             return f"{value:.6f}"
         if isinstance(value, int):

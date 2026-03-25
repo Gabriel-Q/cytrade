@@ -10,11 +10,15 @@ import pickle
 import json
 import sqlite3
 import threading
+from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from core.trading_calendar import minus_one_market_day
+from config.enums import StrategyStatus
 from monitor.logger import get_logger
+from position.models import FifoLot, PositionInfo
+from strategy.models import StrategyConfig, StrategySnapshot
 
 logger = get_logger("system")
 
@@ -91,6 +95,30 @@ CREATE TABLE IF NOT EXISTS orders (
     update_time     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_id      TEXT NOT NULL UNIQUE,
+    strategy_name    TEXT NOT NULL,
+    stock_code       TEXT NOT NULL,
+    total_quantity   INTEGER DEFAULT 0,
+    available_quantity INTEGER DEFAULT 0,
+    is_t0            INTEGER DEFAULT 0,
+    avg_cost         REAL DEFAULT 0,
+    total_cost       REAL DEFAULT 0,
+    current_price    REAL DEFAULT 0,
+    market_value     REAL DEFAULT 0,
+    unrealized_pnl   REAL DEFAULT 0,
+    unrealized_pnl_ratio REAL DEFAULT 0,
+    realized_pnl     REAL DEFAULT 0,
+    total_commission REAL DEFAULT 0,
+    total_buy_commission REAL DEFAULT 0,
+    total_sell_commission REAL DEFAULT 0,
+    total_stamp_tax  REAL DEFAULT 0,
+    total_fees       REAL DEFAULT 0,
+    fifo_lots_json   TEXT DEFAULT '',
+    update_time      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS strategy_pnl_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     strategy_name     TEXT NOT NULL,
@@ -105,10 +133,26 @@ CREATE TABLE IF NOT EXISTS strategy_pnl_history (
     create_time       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS strategy_runtime_state (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_day TEXT NOT NULL,
+    strategy_type TEXT NOT NULL,
+    strategy_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    state_version INTEGER NOT NULL DEFAULT 1,
+    state_json TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(trade_day, strategy_type, strategy_id, scope)
+);
+
 CREATE INDEX IF NOT EXISTS idx_trades_strategy_id  ON trades(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_trades_order_uuid   ON trades(order_uuid);
 CREATE INDEX IF NOT EXISTS idx_orders_strategy_id  ON orders(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status       ON orders(status);
+CREATE INDEX IF NOT EXISTS idx_positions_stock_code ON positions(stock_code);
+CREATE INDEX IF NOT EXISTS idx_strategy_runtime_state_lookup
+ON strategy_runtime_state(trade_day, strategy_type, strategy_id, scope);
 """
 
 
@@ -143,6 +187,8 @@ class DataManager:
         self._remote_enabled = False
         # ``_pg_conn`` 保存可选的 PostgreSQL 连接对象。
         self._pg_conn = None
+        # ``_last_loaded_state_day`` 记录最近一次成功加载的快照交易日。
+        self._last_loaded_state_day = ""
 
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         os.makedirs(state_dir, exist_ok=True)
@@ -307,6 +353,69 @@ class DataManager:
         )
         self._execute(sql, params)
 
+    def save_position(self, position) -> None:
+        """新增或更新一条当前持仓快照。"""
+        fifo_lots = []
+        for lot in getattr(position, "fifo_lots", []) or []:
+            fifo_lots.append({
+                "quantity": int(getattr(lot, "quantity", 0) or 0),
+                "cost_price": float(getattr(lot, "cost_price", 0.0) or 0.0),
+                "buy_time": getattr(getattr(lot, "buy_time", None), "isoformat", lambda: "")(),
+            })
+
+        sql = """
+        INSERT INTO positions
+            (strategy_id, strategy_name, stock_code, total_quantity, available_quantity,
+             is_t0, avg_cost, total_cost, current_price, market_value,
+             unrealized_pnl, unrealized_pnl_ratio, realized_pnl, total_commission,
+             total_buy_commission, total_sell_commission, total_stamp_tax,
+             total_fees, fifo_lots_json, update_time)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(strategy_id) DO UPDATE SET
+            strategy_name = excluded.strategy_name,
+            stock_code = excluded.stock_code,
+            total_quantity = excluded.total_quantity,
+            available_quantity = excluded.available_quantity,
+            is_t0 = excluded.is_t0,
+            avg_cost = excluded.avg_cost,
+            total_cost = excluded.total_cost,
+            current_price = excluded.current_price,
+            market_value = excluded.market_value,
+            unrealized_pnl = excluded.unrealized_pnl,
+            unrealized_pnl_ratio = excluded.unrealized_pnl_ratio,
+            realized_pnl = excluded.realized_pnl,
+            total_commission = excluded.total_commission,
+            total_buy_commission = excluded.total_buy_commission,
+            total_sell_commission = excluded.total_sell_commission,
+            total_stamp_tax = excluded.total_stamp_tax,
+            total_fees = excluded.total_fees,
+            fifo_lots_json = excluded.fifo_lots_json,
+            update_time = excluded.update_time
+        """
+        params = (
+            str(getattr(position, "strategy_id", "") or ""),
+            str(getattr(position, "strategy_name", "") or ""),
+            str(getattr(position, "stock_code", "") or ""),
+            int(getattr(position, "total_quantity", 0) or 0),
+            int(getattr(position, "available_quantity", 0) or 0),
+            1 if bool(getattr(position, "is_t0", False)) else 0,
+            float(getattr(position, "avg_cost", 0.0) or 0.0),
+            float(getattr(position, "total_cost", 0.0) or 0.0),
+            float(getattr(position, "current_price", 0.0) or 0.0),
+            float(getattr(position, "market_value", 0.0) or 0.0),
+            float(getattr(position, "unrealized_pnl", 0.0) or 0.0),
+            float(getattr(position, "unrealized_pnl_ratio", 0.0) or 0.0),
+            float(getattr(position, "realized_pnl", 0.0) or 0.0),
+            float(getattr(position, "total_commission", 0.0) or 0.0),
+            float(getattr(position, "total_buy_commission", 0.0) or 0.0),
+            float(getattr(position, "total_sell_commission", 0.0) or 0.0),
+            float(getattr(position, "total_stamp_tax", 0.0) or 0.0),
+            float(getattr(position, "total_fees", 0.0) or 0.0),
+            self._json_dumps(fifo_lots),
+            getattr(getattr(position, "update_time", None), "isoformat", lambda: datetime.now().isoformat())(),
+        )
+        self._execute(sql, params)
+
     def query_trades(self, strategy_id: Optional[str] = None,
                      start_date: Optional[str] = None,
                      end_date: Optional[str] = None) -> List[Dict]:
@@ -331,7 +440,8 @@ class DataManager:
         return self._fetchall(sql, params)
 
     def query_orders(self, strategy_id: Optional[str] = None,
-                     status: Optional[str] = None) -> List[Dict]:
+                     status: Optional[str] = None,
+                     order_uuids: Optional[List[str]] = None) -> List[Dict]:
         """按条件查询订单记录。"""
         clauses = []
         params: list = []
@@ -341,9 +451,176 @@ class DataManager:
         if status:
             clauses.append("status = ?")
             params.append(status)
+        if order_uuids:
+            placeholders = ",".join(["?"] * len(order_uuids))
+            clauses.append(f"order_uuid IN ({placeholders})")
+            params.extend(order_uuids)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"SELECT * FROM orders {where} ORDER BY create_time DESC"
         return self._fetchall(sql, params)
+
+    def query_positions(self, strategy_id: Optional[str] = None,
+                        include_closed: bool = False) -> List[Dict]:
+        """按条件查询当前持仓快照。"""
+        clauses = []
+        params: list = []
+        if strategy_id:
+            clauses.append("strategy_id = ?")
+            params.append(strategy_id)
+        if not include_closed:
+            clauses.append("total_quantity > 0")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = f"SELECT * FROM positions {where} ORDER BY update_time DESC"
+        return self._fetchall(sql, params)
+
+    # ------------------------------------------------------------------ SQLite 运行态快照
+
+    def save_strategy_runtime_states(self, snapshots: List[StrategySnapshot],
+                                     class_states: Optional[List[Dict[str, Any]]] = None,
+                                     trading_day: Optional[str] = None) -> None:
+        """将策略运行态保存到 SQLite。"""
+        target_day = str(trading_day or datetime.now().strftime("%Y%m%d"))
+        class_states = class_states or []
+        with self._lock:
+            try:
+                with self._get_conn() as conn:
+                    conn.execute("DELETE FROM strategy_runtime_state WHERE trade_day = ?", (target_day,))
+
+                    for snapshot in snapshots or []:
+                        payload = self._json_dumps(self._snapshot_to_json_dict(snapshot))
+                        conn.execute(
+                            """
+                            INSERT INTO strategy_runtime_state
+                              (trade_day, strategy_type, strategy_id, scope, state_version, state_json)
+                            VALUES (?,?,?,?,?,?)
+                            """,
+                            (
+                                target_day,
+                                str(getattr(snapshot, "strategy_name", "") or ""),
+                                str(getattr(snapshot, "strategy_id", "") or ""),
+                                "instance",
+                                int(getattr(snapshot, "state_version", 1) or 1),
+                                payload,
+                            ),
+                        )
+
+                    for item in class_states:
+                        payload = self._json_dumps(dict(item.get("state") or {}))
+                        conn.execute(
+                            """
+                            INSERT INTO strategy_runtime_state
+                              (trade_day, strategy_type, strategy_id, scope, state_version, state_json)
+                            VALUES (?,?,?,?,?,?)
+                            """,
+                            (
+                                target_day,
+                                str(item.get("strategy_type", "") or ""),
+                                "",
+                                "class",
+                                int(item.get("state_version", 1) or 1),
+                                payload,
+                            ),
+                        )
+
+                    conn.commit()
+                logger.info(
+                    "DataManager: SQLite 运行态已保存 → %s (instance=%d class=%d)",
+                    target_day,
+                    len(snapshots or []),
+                    len(class_states),
+                )
+            except Exception as e:
+                logger.error("DataManager: 保存 SQLite 运行态失败: %s", e, exc_info=True)
+                raise
+
+    def load_strategy_runtime_states(self, trading_day: Optional[str] = None,
+                                     fallback_previous_market_day: bool = True) -> Optional[Dict[str, Any]]:
+        """从 SQLite 加载策略运行态。"""
+        target_day = trading_day or datetime.now().strftime("%Y%m%d")
+        candidate_days = [target_day]
+
+        if fallback_previous_market_day:
+            try:
+                previous_day = minus_one_market_day(target_day)
+                if previous_day not in candidate_days:
+                    candidate_days.append(previous_day)
+            except Exception as exc:
+                logger.warning("DataManager: 计算上一交易日失败，跳过 SQLite 运行态回退加载: %s", exc)
+
+        for day in candidate_days:
+            rows = self._fetchall(
+                "SELECT * FROM strategy_runtime_state WHERE trade_day = ? ORDER BY scope, strategy_type, strategy_id",
+                [day],
+            )
+            if not rows:
+                continue
+
+            instance_states: List[StrategySnapshot] = []
+            class_states: List[Dict[str, Any]] = []
+            for row in rows:
+                scope = str(row.get("scope", "") or "")
+                state_json = str(row.get("state_json", "") or "{}")
+                try:
+                    payload = json.loads(state_json)
+                except Exception:
+                    payload = {}
+
+                if scope == "instance":
+                    instance_states.append(self._snapshot_from_json_dict(payload))
+                elif scope == "class":
+                    class_states.append({
+                        "strategy_type": str(row.get("strategy_type", "") or ""),
+                        "state_version": int(row.get("state_version", 1) or 1),
+                        "state": dict(payload or {}),
+                    })
+
+            self._last_loaded_state_day = str(day or "")
+            logger.info(
+                "DataManager: 加载 SQLite 运行态 ← %s (instance=%d class=%d)",
+                day,
+                len(instance_states),
+                len(class_states),
+            )
+            return {
+                "trade_day": str(day or ""),
+                "instance_states": instance_states,
+                "class_states": class_states,
+            }
+
+        return None
+
+    def clear_strategy_runtime_state(self, strategy_id: str,
+                                     strategy_type: Optional[str] = None,
+                                     trading_day: Optional[str] = None) -> int:
+        """删除单个策略实例的 SQLite 运行态记录。"""
+        clauses = ["strategy_id = ?"]
+        params: List[Any] = [str(strategy_id or "")]
+        if strategy_type:
+            clauses.append("strategy_type = ?")
+            params.append(str(strategy_type or ""))
+        if trading_day:
+            clauses.append("trade_day = ?")
+            params.append(str(trading_day or ""))
+        where = " AND ".join(clauses)
+        with self._lock:
+            with self._get_conn() as conn:
+                cursor = conn.execute(f"DELETE FROM strategy_runtime_state WHERE {where}", tuple(params))
+                conn.commit()
+                return int(getattr(cursor, "rowcount", 0) or 0)
+
+    def clear_all_strategy_runtime_states(self, trading_day: Optional[str] = None) -> int:
+        """删除 SQLite 中全部或指定交易日的策略运行态。"""
+        with self._lock:
+            with self._get_conn() as conn:
+                if trading_day:
+                    cursor = conn.execute(
+                        "DELETE FROM strategy_runtime_state WHERE trade_day = ?",
+                        (str(trading_day or ""),),
+                    )
+                else:
+                    cursor = conn.execute("DELETE FROM strategy_runtime_state")
+                conn.commit()
+                return int(getattr(cursor, "rowcount", 0) or 0)
 
     # ------------------------------------------------------------------ Pickle 状态
 
@@ -400,6 +677,7 @@ class DataManager:
             try:
                 with open(path, "rb") as f:
                     snapshots = pickle.load(f)
+                self._last_loaded_state_day = str(day or "")
                 logger.info("DataManager: 加载策略状态 ← %s (%d 条)", path, len(snapshots))
                 return snapshots
             except Exception as e:
@@ -413,6 +691,40 @@ class DataManager:
         path = self._state_file(trading_day)
         if os.path.exists(path):
             os.remove(path)
+
+    def clear_all_strategy_states(self) -> int:
+        """删除状态目录下全部策略快照文件。"""
+        removed = 0
+        for name in os.listdir(self._state_dir):
+            if not str(name).startswith("strategy_state_") or not str(name).endswith(".pkl"):
+                continue
+            path = os.path.join(self._state_dir, name)
+            if os.path.isfile(path):
+                os.remove(path)
+                removed += 1
+        return removed
+
+    def clear_runtime_data(self) -> None:
+        """清空运行期数据库数据。"""
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute("DELETE FROM trades")
+                conn.execute("DELETE FROM orders")
+                conn.execute("DELETE FROM positions")
+                conn.execute("DELETE FROM strategy_pnl_history")
+                conn.execute("DELETE FROM strategy_runtime_state")
+                conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('trades', 'orders', 'positions', 'strategy_pnl_history', 'strategy_runtime_state')")
+                conn.commit()
+
+    def cleanup_orphan_trades(self) -> int:
+        """删除缺少策略 ID 的历史脏成交记录。"""
+        with self._lock:
+            with self._get_conn() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM trades WHERE trim(coalesce(strategy_id, '')) = ''"
+                )
+                conn.commit()
+                return int(getattr(cursor, "rowcount", 0) or 0)
 
     def close(self) -> None:
         """释放数据管理器持有的外部资源。"""
@@ -484,6 +796,151 @@ class DataManager:
         target_day = str(trading_day or datetime.now().strftime("%Y%m%d"))
         return os.path.join(self._state_dir, f"strategy_state_{target_day}.pkl")
 
+    @staticmethod
+    def _snapshot_to_json_dict(snapshot: StrategySnapshot) -> Dict[str, Any]:
+        """把 StrategySnapshot 转成 JSON 安全字典。"""
+        position = getattr(snapshot, "position", None) or PositionInfo()
+        config = getattr(snapshot, "config", None) or StrategyConfig()
+        fifo_lots = []
+        for lot in getattr(position, "fifo_lots", []) or []:
+            fifo_lots.append({
+                "quantity": int(getattr(lot, "quantity", 0) or 0),
+                "cost_price": float(getattr(lot, "cost_price", 0.0) or 0.0),
+                "buy_time": getattr(getattr(lot, "buy_time", None), "isoformat", lambda: "")(),
+            })
+
+        return {
+            "strategy_id": str(getattr(snapshot, "strategy_id", "") or ""),
+            "strategy_name": str(getattr(snapshot, "strategy_name", "") or ""),
+            "stock_code": str(getattr(snapshot, "stock_code", "") or ""),
+            "status": str(getattr(getattr(snapshot, "status", None), "value", getattr(snapshot, "status", "")) or ""),
+            "config": {
+                "stock_code": str(getattr(config, "stock_code", "") or ""),
+                "entry_price": float(getattr(config, "entry_price", 0.0) or 0.0),
+                "stop_loss_price": float(getattr(config, "stop_loss_price", 0.0) or 0.0),
+                "take_profit_price": float(getattr(config, "take_profit_price", 0.0) or 0.0),
+                "max_position_amount": float(getattr(config, "max_position_amount", 0.0) or 0.0),
+                "params": dict(getattr(config, "params", {}) or {}),
+            },
+            "position": {
+                "strategy_id": str(getattr(position, "strategy_id", "") or ""),
+                "strategy_name": str(getattr(position, "strategy_name", "") or ""),
+                "stock_code": str(getattr(position, "stock_code", "") or ""),
+                "total_quantity": int(getattr(position, "total_quantity", 0) or 0),
+                "available_quantity": int(getattr(position, "available_quantity", 0) or 0),
+                "is_t0": bool(getattr(position, "is_t0", False)),
+                "avg_cost": float(getattr(position, "avg_cost", 0.0) or 0.0),
+                "total_cost": float(getattr(position, "total_cost", 0.0) or 0.0),
+                "current_price": float(getattr(position, "current_price", 0.0) or 0.0),
+                "market_value": float(getattr(position, "market_value", 0.0) or 0.0),
+                "unrealized_pnl": float(getattr(position, "unrealized_pnl", 0.0) or 0.0),
+                "unrealized_pnl_ratio": float(getattr(position, "unrealized_pnl_ratio", 0.0) or 0.0),
+                "realized_pnl": float(getattr(position, "realized_pnl", 0.0) or 0.0),
+                "total_commission": float(getattr(position, "total_commission", 0.0) or 0.0),
+                "total_buy_commission": float(getattr(position, "total_buy_commission", 0.0) or 0.0),
+                "total_sell_commission": float(getattr(position, "total_sell_commission", 0.0) or 0.0),
+                "total_stamp_tax": float(getattr(position, "total_stamp_tax", 0.0) or 0.0),
+                "total_fees": float(getattr(position, "total_fees", 0.0) or 0.0),
+                "fifo_lots": fifo_lots,
+                "update_time": getattr(getattr(position, "update_time", None), "isoformat", lambda: "")(),
+            },
+            "pending_order_uuids": list(getattr(snapshot, "pending_order_uuids", []) or []),
+            "pause_reason": str(getattr(snapshot, "pause_reason", "") or ""),
+            "pending_close_requested": bool(getattr(snapshot, "pending_close_requested", False)),
+            "pending_close_remark": str(getattr(snapshot, "pending_close_remark", "") or ""),
+            "custom_state": dict(getattr(snapshot, "custom_state", {}) or {}),
+            "create_time": getattr(getattr(snapshot, "create_time", None), "isoformat", lambda: "")(),
+            "update_time": getattr(getattr(snapshot, "update_time", None), "isoformat", lambda: "")(),
+            "state_version": int(getattr(snapshot, "state_version", 1) or 1),
+        }
+
+    @staticmethod
+    def _snapshot_from_json_dict(payload: Dict[str, Any]) -> StrategySnapshot:
+        """把 JSON 字典恢复为 StrategySnapshot。"""
+        config_payload = dict(payload.get("config") or {})
+        position_payload = dict(payload.get("position") or {})
+
+        fifo_lots = []
+        for lot in position_payload.get("fifo_lots", []) or []:
+            buy_time_text = str(lot.get("buy_time", "") or "").strip()
+            try:
+                buy_time = datetime.fromisoformat(buy_time_text.replace("Z", "+00:00")) if buy_time_text else datetime.now()
+            except ValueError:
+                buy_time = datetime.now()
+            fifo_lots.append(FifoLot(
+                quantity=int(lot.get("quantity", 0) or 0),
+                cost_price=float(lot.get("cost_price", 0.0) or 0.0),
+                buy_time=buy_time,
+            ))
+
+        update_time_text = str(position_payload.get("update_time", "") or "").strip()
+        create_time_text = str(payload.get("create_time", "") or "").strip()
+        snapshot_update_time_text = str(payload.get("update_time", "") or "").strip()
+        try:
+            position_update_time = datetime.fromisoformat(update_time_text.replace(" ", "T")) if update_time_text else datetime.now()
+        except ValueError:
+            position_update_time = datetime.now()
+        try:
+            create_time = datetime.fromisoformat(create_time_text.replace(" ", "T")) if create_time_text else datetime.now()
+        except ValueError:
+            create_time = datetime.now()
+        try:
+            update_time = datetime.fromisoformat(snapshot_update_time_text.replace(" ", "T")) if snapshot_update_time_text else datetime.now()
+        except ValueError:
+            update_time = datetime.now()
+
+        status_value = str(payload.get("status", StrategyStatus.INITIALIZING.value) or StrategyStatus.INITIALIZING.value)
+        try:
+            status = StrategyStatus(status_value)
+        except Exception:
+            status = StrategyStatus.INITIALIZING
+
+        snapshot = StrategySnapshot(
+            strategy_id=str(payload.get("strategy_id", "") or ""),
+            strategy_name=str(payload.get("strategy_name", "") or ""),
+            stock_code=str(payload.get("stock_code", "") or ""),
+            status=status,
+            config=StrategyConfig(
+                stock_code=str(config_payload.get("stock_code", "") or ""),
+                entry_price=float(config_payload.get("entry_price", 0.0) or 0.0),
+                stop_loss_price=float(config_payload.get("stop_loss_price", 0.0) or 0.0),
+                take_profit_price=float(config_payload.get("take_profit_price", 0.0) or 0.0),
+                max_position_amount=float(config_payload.get("max_position_amount", 0.0) or 0.0),
+                params=dict(config_payload.get("params") or {}),
+            ),
+            position=PositionInfo(
+                strategy_id=str(position_payload.get("strategy_id", "") or ""),
+                strategy_name=str(position_payload.get("strategy_name", "") or ""),
+                stock_code=str(position_payload.get("stock_code", "") or ""),
+                total_quantity=int(position_payload.get("total_quantity", 0) or 0),
+                available_quantity=int(position_payload.get("available_quantity", 0) or 0),
+                is_t0=bool(position_payload.get("is_t0", False)),
+                avg_cost=float(position_payload.get("avg_cost", 0.0) or 0.0),
+                total_cost=float(position_payload.get("total_cost", 0.0) or 0.0),
+                current_price=float(position_payload.get("current_price", 0.0) or 0.0),
+                market_value=float(position_payload.get("market_value", 0.0) or 0.0),
+                unrealized_pnl=float(position_payload.get("unrealized_pnl", 0.0) or 0.0),
+                unrealized_pnl_ratio=float(position_payload.get("unrealized_pnl_ratio", 0.0) or 0.0),
+                realized_pnl=float(position_payload.get("realized_pnl", 0.0) or 0.0),
+                total_commission=float(position_payload.get("total_commission", 0.0) or 0.0),
+                total_buy_commission=float(position_payload.get("total_buy_commission", 0.0) or 0.0),
+                total_sell_commission=float(position_payload.get("total_sell_commission", 0.0) or 0.0),
+                total_stamp_tax=float(position_payload.get("total_stamp_tax", 0.0) or 0.0),
+                total_fees=float(position_payload.get("total_fees", 0.0) or 0.0),
+                fifo_lots=fifo_lots,
+                update_time=position_update_time,
+            ),
+            pending_order_uuids=list(payload.get("pending_order_uuids", []) or []),
+            pause_reason=str(payload.get("pause_reason", "") or ""),
+            pending_close_requested=bool(payload.get("pending_close_requested", False)),
+            pending_close_remark=str(payload.get("pending_close_remark", "") or ""),
+            custom_state=dict(payload.get("custom_state") or {}),
+            create_time=create_time,
+            update_time=update_time,
+        )
+        setattr(snapshot, "state_version", int(payload.get("state_version", 1) or 1))
+        return snapshot
+
     def _connect_pg(self) -> None:
         """尝试连接远程 PostgreSQL。"""
         if not self._remote_cfg or not self._remote_cfg.get("host"):
@@ -523,6 +980,14 @@ class DataManager:
             ))
         self._pg_conn.commit()
         logger.info("DataManager: 同步 %d 条成交到远程数据库", len(trades))
+
+    @staticmethod
+    def _json_dumps(value: Any) -> str:
+        """把任意对象尽量稳定地序列化为 JSON 字符串。"""
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except TypeError:
+            return "{}"
 
     @staticmethod
     def _migrate_xt_order_id_columns(conn: sqlite3.Connection) -> None:

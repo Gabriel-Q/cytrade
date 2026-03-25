@@ -56,6 +56,9 @@ class StrategySnapshot:
     config: StrategyConfig = field(default_factory=StrategyConfig)  # 策略初始化配置副本。
     position: PositionInfo = field(default_factory=PositionInfo)  # 当前持仓状态快照。
     pending_order_uuids: List[str] = field(default_factory=list)  # 尚未完结的内部订单 UUID 列表。
+    pause_reason: str = ""  # 当前暂停原因；为空表示未记录暂停原因。
+    pending_close_requested: bool = False  # 是否存在跨交易日延续的待平仓请求。
+    pending_close_remark: str = ""  # 待平仓请求的备注，便于恢复后继续按原原因平仓。
     custom_state: Dict[str, Any] = field(default_factory=dict)  # 策略自定义持久化状态，供子类保存自己的状态机变量。
     create_time: datetime = field(default_factory=datetime.now)  # 快照首次创建时间。
     update_time: datetime = field(default_factory=datetime.now)  # 快照最近一次更新时间。

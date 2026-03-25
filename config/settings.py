@@ -9,6 +9,39 @@ from config.enums import SubscriptionPeriod
 
 
 _CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_LOCAL_RUNTIME_CONFIG_PATH = os.path.join(_CONFIG_DIR, "local_runtime.json")
+_LOCAL_RUNTIME_CONFIG_PATH = os.getenv(
+    "CYTRADE_LOCAL_SETTINGS_PATH",
+    _DEFAULT_LOCAL_RUNTIME_CONFIG_PATH,
+)
+
+
+def _load_local_runtime_config() -> dict:
+    """读取本地固定配置文件。
+
+    该文件主要用于保存本机运行所需的 QMT 路径、资金账号等配置，
+    避免每次开新终端都需要重新设置环境变量。
+    """
+    if not os.path.exists(_LOCAL_RUNTIME_CONFIG_PATH):
+        return {}
+    try:
+        with open(_LOCAL_RUNTIME_CONFIG_PATH, "r", encoding="utf-8") as fp:
+            value = json.load(fp)
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+_LOCAL_RUNTIME_CONFIG = _load_local_runtime_config()
+
+
+def _setting_str(name: str, default: str = "") -> str:
+    """读取字符串配置，优先环境变量，其次本地固定配置文件。"""
+    raw = os.getenv(name)
+    if raw is not None and raw != "":
+        return raw
+    value = _LOCAL_RUNTIME_CONFIG.get(name, default)
+    return str(value) if value is not None else default
 
 
 def _env_str(name: str, default: str = "") -> str:
@@ -110,11 +143,17 @@ class Settings:
     这个类的职责是把“环境变量 + 默认值 + 运行时覆盖值”整合成一份
     可直接使用的配置快照。
     """
+    LOCAL_RUNTIME_CONFIG_PATH: str = _LOCAL_RUNTIME_CONFIG_PATH
+
     # ---- QMT 连接 ----
-    QMT_PATH: str = _env_str("QMT_PATH", "")
-    ACCOUNT_ID: str = _env_str("ACCOUNT_ID", "")
-    ACCOUNT_TYPE: str = _env_str("ACCOUNT_TYPE", "STOCK")
-    ACCOUNT_PASSWORD: str = _env_str("ACCOUNT_PASSWORD", "")
+    QMT_PATH: str = _setting_str("QMT_PATH", "")
+    ACCOUNT_ID: str = _setting_str("ACCOUNT_ID", "")
+    ACCOUNT_TYPE: str = _setting_str("ACCOUNT_TYPE", "STOCK")
+    ACCOUNT_PASSWORD: str = _setting_str("ACCOUNT_PASSWORD", "")
+    CYTRADE_BBPP_CSV_PATH: str = _setting_str(
+        "CYTRADE_BBPP_CSV_PATH",
+        os.path.join(_CONFIG_DIR, "bbpp_signals_20260324.csv"),
+    )
 
     # ---- 数据订阅 ----
     SUBSCRIPTION_PERIOD: SubscriptionPeriod = _env_enum(
@@ -139,6 +178,8 @@ class Settings:
     # ---- 数据持久化 ----
     SQLITE_DB_PATH: str = _env_str("SQLITE_DB_PATH", "./data/db/cytrade.db")
     STATE_SAVE_DIR: str = _env_str("STATE_SAVE_DIR", "./saved_states")
+    STATE_AUTOSAVE_INTERVAL_SEC: int = _env_int("STATE_AUTOSAVE_INTERVAL_SEC", 300)
+    STATE_REALTIME_PERSIST_MIN_INTERVAL_SEC: float = _env_float("STATE_REALTIME_PERSIST_MIN_INTERVAL_SEC", 3.0)
     ENABLE_REMOTE_DB: bool = _env_bool("ENABLE_REMOTE_DB", False)             # 是否同步远程数据库
     REMOTE_DB_CONFIG: dict = _env_json_dict("REMOTE_DB_CONFIG", {
         "host": "",
@@ -163,7 +204,7 @@ class Settings:
 
     # ---- 日内会话控制 ----
     SESSION_START_TIME: str = _env_str("SESSION_START_TIME", "09:25")
-    SESSION_EXIT_TIME: str = _env_str("SESSION_EXIT_TIME", "15:05")
+    SESSION_EXIT_TIME: str = _env_str("SESSION_EXIT_TIME", "23:00")
     SESSION_POLL_INTERVAL_SEC: int = _env_int("SESSION_POLL_INTERVAL_SEC", 15)
     LOAD_PREVIOUS_STATE_ON_START: bool = _env_bool("LOAD_PREVIOUS_STATE_ON_START", True)
 

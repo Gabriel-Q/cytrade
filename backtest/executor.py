@@ -95,6 +95,28 @@ class BacktestTradeExecutor:
         )
         return self._submit_order(order)
 
+    def buy_latest(self, strategy_id: str, strategy_name: str,
+                   stock_code: str, quantity: int, remark: str = "") -> Order:
+        """创建最新价买单。"""
+        return self.buy_market(
+            strategy_id,
+            strategy_name,
+            stock_code,
+            quantity,
+            remark=remark or f"回测最新价买入 {stock_code}",
+        )
+
+    def buy_best5_or_cancel(self, strategy_id: str, strategy_name: str,
+                            stock_code: str, quantity: int, remark: str = "") -> Order:
+        """创建最优五档即时成交剩余撤销买单。"""
+        return self.buy_market(
+            strategy_id,
+            strategy_name,
+            stock_code,
+            quantity,
+            remark=remark or f"回测最优五档买入 {stock_code}",
+        )
+
     def buy_by_amount(self, strategy_id: str, strategy_name: str,
                       stock_code: str, price: float,
                       amount: float, remark: str = "") -> Order:
@@ -149,6 +171,28 @@ class BacktestTradeExecutor:
             remark=remark or f"回测市价卖出 {stock_code}",
         )
         return self._submit_order(order)
+
+    def sell_latest(self, strategy_id: str, strategy_name: str,
+                    stock_code: str, quantity: int, remark: str = "") -> Order:
+        """创建最新价卖单。"""
+        return self.sell_market(
+            strategy_id,
+            strategy_name,
+            stock_code,
+            quantity,
+            remark=remark or f"回测最新价卖出 {stock_code}",
+        )
+
+    def sell_best5_or_cancel(self, strategy_id: str, strategy_name: str,
+                             stock_code: str, quantity: int, remark: str = "") -> Order:
+        """创建最优五档即时成交剩余撤销卖单。"""
+        return self.sell_market(
+            strategy_id,
+            strategy_name,
+            stock_code,
+            quantity,
+            remark=remark or f"回测最优五档卖出 {stock_code}",
+        )
 
     def close_position(self, strategy_id: str, strategy_name: str,
                        stock_code: str, remark: str = "") -> Order:
@@ -225,6 +269,65 @@ class BacktestTradeExecutor:
         """把尚未成交的订单全部标记为已撤。"""
         for order_uuid in list(self._pending_orders.keys()):
             self.cancel_order(order_uuid, reason)
+
+    def force_close_positions(self, bars: Dict[str, BacktestBar], remark: str = "回测结束日收盘强平") -> None:
+        """按最后一个批次的收盘价强制平掉全部持仓。"""
+        if not self._position_mgr:
+            return
+
+        for strategy_id, position in list(self._position_mgr.get_all_positions().items()):
+            quantity = int(getattr(position, "total_quantity", 0) or 0)
+            stock_code = str(getattr(position, "stock_code", "") or "")
+            strategy_name = str(getattr(position, "strategy_name", "") or "")
+            if quantity <= 0 or not stock_code:
+                continue
+
+            bar = bars.get(stock_code)
+            if not bar:
+                continue
+
+            fill_price = float(bar.close_price or 0.0)
+            if fill_price <= 0:
+                continue
+
+            order = self._new_order(
+                strategy_id=strategy_id,
+                strategy_name=strategy_name,
+                stock_code=stock_code,
+                direction=OrderDirection.SELL,
+                order_type=OrderType.LIMIT,
+                price=fill_price,
+                quantity=quantity,
+                amount=0.0,
+                remark=remark,
+            )
+            order.xt_order_id = self._next_xt_order_id
+            self._next_xt_order_id += 1
+            order.status = OrderStatus.WAIT_REPORTING
+            self._order_mgr.register_order(order)
+            self._order_mgr.update_order_status(order.xt_order_id, OrderStatus.REPORTED)
+
+            trade_amount = fill_price * quantity
+            self._apply_cash_change(order, fill_price)
+            trade_info = {
+                "account_type": 0,
+                "account_id": "BACKTEST",
+                "order_type": 0,
+                "traded_id": f"BT-FORCE-{order.xt_order_id}-{int(bar.data_time.timestamp())}",
+                "traded_time": int(bar.data_time.strftime("%Y%m%d%H%M%S")),
+                "order_sysid": str(order.xt_order_id),
+                "strategy_name": strategy_name,
+                "order_remark": remark,
+                "stock_code": stock_code,
+                "direction": order.direction.value,
+                "price": fill_price,
+                "traded_price": fill_price,
+                "quantity": quantity,
+                "traded_volume": quantity,
+                "amount": trade_amount,
+                "traded_amount": trade_amount,
+            }
+            self._order_mgr.on_trade(order.xt_order_id, trade_info)
 
     def _new_order(self, strategy_id: str, strategy_name: str, stock_code: str,
                    direction: OrderDirection, order_type: OrderType, price: float,

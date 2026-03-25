@@ -49,6 +49,14 @@ class PositionManager:
         self._fee_schedule = fee_schedule
         # ``_lock`` 保护多线程下的持仓字典与持仓对象更新。
         self._lock = threading.Lock()
+        # ``_last_unlock_trade_day`` 用于保证同一个交易日只执行一次 T+1 可用数量解锁。
+        self._last_unlock_trade_day: str = ""
+        # ``_state_change_callback`` 用于在持仓发生实质变化后触发策略快照持久化。
+        self._state_change_callback: Optional[Callable[[str], None]] = None
+
+    def set_state_change_callback(self, callback: Callable[[str], None]) -> None:
+        """注册持仓变更后的持久化回调。"""
+        self._state_change_callback = callback
 
     # ------------------------------------------------------------------ 成交回调
 
@@ -101,6 +109,8 @@ class PositionManager:
                 strategy_id[:8], pos.stock_code, pos.total_quantity,
                 pos.avg_cost, pos.unrealized_pnl, pos.realized_pnl
             )
+            self._persist_position(pos)
+            self._notify_state_change(f"trade:{trade.strategy_id}:{trade.stock_code}")
 
         except Exception as e:
             logger.error("PositionManager: on_trade_callback 异常: %s", e, exc_info=True)
@@ -117,6 +127,7 @@ class PositionManager:
                 if pos.stock_code == stock_code and pos.total_quantity > 0:
                     # 一个股票可能被多个策略分别持有，所以这里按 stock_code 广播刷新所有相关仓位。
                     pos.refresh_market_value(price)
+                    self._persist_position(pos)
 
     # ------------------------------------------------------------------ 查询
 
@@ -130,6 +141,11 @@ class PositionManager:
         with self._lock:
             return dict(self._positions)
 
+    @staticmethod
+    def _is_managed_position(position: PositionInfo) -> bool:
+        """判断持仓是否归属于本系统托管的策略实例。"""
+        return bool((position.strategy_id or "").strip() or (position.strategy_name or "").strip())
+
     def get_position_summary(self) -> dict:
         """返回全部持仓的汇总统计结果。
 
@@ -137,18 +153,19 @@ class PositionManager:
             一个普通字典，便于直接给 Web/API 层使用。
         """
         with self._lock:
+            managed_positions = [p for p in self._positions.values() if self._is_managed_position(p)]
             # 这里把所有聚合指标一次性算出，
             # 避免上层重复遍历持仓字典。
-            total_market = sum(p.market_value for p in self._positions.values())
-            total_cost = sum(p.total_cost for p in self._positions.values())
-            total_unrealized = sum(p.unrealized_pnl for p in self._positions.values())
-            total_realized = sum(p.realized_pnl for p in self._positions.values())
-            total_commission = sum(p.total_commission for p in self._positions.values())
-            total_buy_commission = sum(p.total_buy_commission for p in self._positions.values())
-            total_sell_commission = sum(p.total_sell_commission for p in self._positions.values())
-            total_stamp_tax = sum(p.total_stamp_tax for p in self._positions.values())
+            total_market = sum(p.market_value for p in managed_positions)
+            total_cost = sum(p.total_cost for p in managed_positions)
+            total_unrealized = sum(p.unrealized_pnl for p in managed_positions)
+            total_realized = sum(p.realized_pnl for p in managed_positions)
+            total_commission = sum(p.total_commission for p in managed_positions)
+            total_buy_commission = sum(p.total_buy_commission for p in managed_positions)
+            total_sell_commission = sum(p.total_sell_commission for p in managed_positions)
+            total_stamp_tax = sum(p.total_stamp_tax for p in managed_positions)
             return {
-                "positions_count": len(self._positions),
+                "positions_count": len(managed_positions),
                 "total_market_value": total_market,
                 "total_cost": total_cost,
                 "total_unrealized_pnl": total_unrealized,
@@ -183,6 +200,9 @@ class PositionManager:
                 logger.info("PositionManager: 策略 %s 盈亏已归档", strategy_id[:8])
             except Exception as e:
                 logger.error("PositionManager: 盈亏归档失败: %s", e, exc_info=True)
+            self._persist_position(pos)
+        if pos:
+            self._notify_state_change(f"remove_position:{strategy_id}")
 
     def restore_position(self, strategy_id: str, position: PositionInfo) -> None:
         """从快照中恢复单个策略持仓。
@@ -195,15 +215,96 @@ class PositionManager:
             # 恢复时重新计算这些“可推导字段”，
             # 避免旧快照中的冗余值与当前规则不一致。
             position.is_t0 = self._resolve_is_t0(position.stock_code, position)
+            if self._cost_method == CostMethod.FIFO and position.total_quantity > 0 and not position.fifo_lots:
+                position.fifo_lots = [FifoLot(quantity=position.total_quantity, cost_price=position.avg_cost)]
             # available_quantity 恢复为 total_quantity，表示恢复时默认全部可卖；
             # 若未来需要严格恢复 T+1 冻结细节，可在快照中继续扩展该状态。
-            position.available_quantity = position.total_quantity
+            restored_available = int(position.available_quantity or 0)
+            restored_total = int(position.total_quantity or 0)
+            position.available_quantity = min(max(0, restored_available), restored_total)
             position.total_commission = position.total_fees or position.total_commission
+            if position.total_cost <= 0 and position.avg_cost > 0 and position.total_quantity > 0:
+                position.total_cost = position.avg_cost * position.total_quantity
+            if position.current_price <= 0:
+                position.current_price = position.avg_cost
+            if position.total_quantity > 0:
+                position.refresh_market_value(position.current_price or position.avg_cost)
             self._positions[strategy_id] = position
+            self._persist_position(position)
         logger.info(
             "PositionManager: 持仓已恢复 strategy=%s code=%s qty=%d avg_cost=%.3f",
             strategy_id[:8], position.stock_code, position.total_quantity, position.avg_cost
         )
+
+    def unlock_available_quantities(self, trade_day: str) -> int:
+        """进入新交易日时，为非 T0 持仓恢复可卖数量。"""
+        normalized_trade_day = str(trade_day or "").strip()
+        if not normalized_trade_day:
+            return 0
+
+        unlocked = 0
+        with self._lock:
+            if normalized_trade_day == self._last_unlock_trade_day:
+                return 0
+            self._last_unlock_trade_day = normalized_trade_day
+            for position in self._positions.values():
+                if position.total_quantity <= 0 or position.is_t0:
+                    continue
+                if position.available_quantity == position.total_quantity:
+                    continue
+                position.available_quantity = position.total_quantity
+                position.update_time = datetime.now()
+                unlocked += 1
+        if unlocked > 0:
+            with self._lock:
+                for position in self._positions.values():
+                    if position.total_quantity > 0:
+                        self._persist_position(position)
+            logger.info("PositionManager: 新交易日 %s 已解锁 %d 个持仓的可卖数量", normalized_trade_day, unlocked)
+            self._notify_state_change(f"unlock:{normalized_trade_day}")
+        return unlocked
+
+    def mark_trade_day_processed(self, trade_day: str) -> None:
+        """标记某个交易日的解锁逻辑已处理，避免同日重启后重复解锁。"""
+        normalized_trade_day = str(trade_day or "").strip()
+        if not normalized_trade_day:
+            return
+        with self._lock:
+            self._last_unlock_trade_day = normalized_trade_day
+
+    def sync_available_quantity(self, strategy_id: str, available_quantity: int) -> bool:
+        """按账户真实可用量校正某个策略持仓的可卖数量。"""
+        with self._lock:
+            position = self._positions.get(strategy_id)
+            if not position:
+                return False
+            clamped_available = min(max(0, int(available_quantity or 0)), int(position.total_quantity or 0))
+            if position.available_quantity == clamped_available:
+                return False
+            position.available_quantity = clamped_available
+            position.update_time = datetime.now()
+            self._persist_position(position)
+            return True
+
+    def _persist_position(self, position: PositionInfo) -> None:
+        """把当前持仓快照同步到 SQLite。"""
+        if not self._data_mgr or not position:
+            return
+        if not self._is_managed_position(position):
+            return
+        try:
+            self._data_mgr.save_position(position)
+        except Exception as exc:
+            logger.error("PositionManager: 持久化持仓失败: %s", exc, exc_info=True)
+
+    def _notify_state_change(self, reason: str) -> None:
+        """在持仓实质变更后通知上层保存最新策略快照。"""
+        if not self._state_change_callback:
+            return
+        try:
+            self._state_change_callback(reason)
+        except Exception as exc:
+            logger.error("PositionManager: 状态变更回调失败: %s", exc, exc_info=True)
 
     # ------------------------------------------------------------------ PRIVATE
 
@@ -237,6 +338,8 @@ class PositionManager:
                 pos.available_quantity += qty
             # 即便用 FIFO，avg_cost 仍保留一个整体均价，便于界面展示与快速查看。
             pos.avg_cost = pos.total_cost / pos.total_quantity if pos.total_quantity > 0 else 0
+
+        pos.refresh_market_value(price)
 
     def _apply_sell(self, pos: PositionInfo, trade: TradeRecord) -> None:
         """把一笔卖出成交应用到持仓对象上。
@@ -287,6 +390,14 @@ class PositionManager:
             # FIFO 下总成本由剩余 lot 重新汇总，而不是简单减一个平均成本。
             pos.total_cost = sum(l.quantity * l.cost_price for l in pos.fifo_lots)
             pos.avg_cost = pos.total_cost / pos.total_quantity if pos.total_quantity > 0 else 0
+
+        if pos.total_quantity > 0:
+            pos.refresh_market_value(price)
+        else:
+            pos.current_price = float(price)
+            pos.market_value = 0.0
+            pos.unrealized_pnl = 0.0
+            pos.unrealized_pnl_ratio = 0.0
 
     def _trade_total_fee(self, trade: TradeRecord) -> float:
         """返回一笔成交应计入持仓口径的总费用。"""

@@ -54,6 +54,8 @@ class OrderManager:
         self._strategy_callback: Optional[Callable[[Order], None]] = None
         # ``_trade_callback`` 在成交后通知其他订阅方，例如 WebSocket。
         self._trade_callback: Optional[Callable[[TradeRecord], None]] = None
+        # ``_state_change_callback`` 用于在订单生命周期变化后触发策略快照持久化。
+        self._state_change_callback: Optional[Callable[[str], None]] = None
         # ``_lock`` 保护订单字典和映射字典在多线程环境下的一致性。
         self._lock = threading.Lock()
 
@@ -79,6 +81,7 @@ class OrderManager:
                     order.order_uuid[:8], f" xt_id={order.xt_order_id}" if order.xt_order_id else "",
                     order.stock_code, order.direction.value,
                     order.price, order.quantity, order.remark)
+        self._notify_state_change(f"register_order:{order.order_uuid}")
 
     # ------------------------------------------------------------------ 状态更新
 
@@ -136,6 +139,7 @@ class OrderManager:
                 logger.error("OrderManager: 策略回调异常: %s", e, exc_info=True)
 
         logger.debug("[ORDER] 订单状态变更 uuid=%s status=%s", uuid[:8], status.value)
+        self._notify_state_change(f"update_order_status:{uuid}")
 
     def on_trade(self, xt_order_id: int, trade_info: dict) -> None:
         """成交回报入口。
@@ -155,8 +159,19 @@ class OrderManager:
 
             # 如果能找到原订单，就尽量沿用原订单上的 strategy_id/strategy_name；
             # 找不到时再从成交回报字段里兜底取值。
-            strategy_id = order.strategy_id if order else ""
-            strategy_name = str(trade_info.get("strategy_name", "") or "") or (order.strategy_name if order else "")
+            strategy_id = str(trade_info.get("strategy_id", "") or "") or (order.strategy_id if order else "")
+            strategy_name = (order.strategy_name if order else "") or str(trade_info.get("strategy_name", "") or "")
+            is_strategy_trade = bool(order or strategy_id)
+
+            if not is_strategy_trade:
+                logger.info(
+                    "[ORDER] 忽略无策略归属成交 xt_order_id=%s code=%s price=%.3f qty=%s",
+                    xt_order_id,
+                    str(trade_info.get("stock_code", "") or ""),
+                    float(trade_info.get("traded_price", trade_info.get("price", 0)) or 0.0),
+                    int(trade_info.get("traded_volume", trade_info.get("quantity", 0)) or 0),
+                )
+                return
 
             xt_order_type = self._to_int(trade_info.get("order_type", 0))
             xt_direction = self._to_int(trade_info.get("direction", 0))
@@ -256,6 +271,7 @@ class OrderManager:
 
             logger.info("[ORDER] [TRADE] 成交 uuid=%s code=%s price=%.3f qty=%d",
                         (uuid or "?")[:8], trade.stock_code, trade.price, trade.quantity)
+            self._notify_state_change(f"trade:{uuid or xt_order_id}")
 
         except Exception as e:
             logger.error("OrderManager: on_trade 处理异常: %s", e, exc_info=True)
@@ -428,6 +444,7 @@ class OrderManager:
                     order.status = OrderStatus.WAIT_REPORTING
                     order.update_time = datetime.now()
         logger.debug("OrderManager: async_response seq=%d → xt_id=%d", seq, xt_order_id)
+        self._notify_state_change(f"async_response:{xt_order_id}")
 
     def register_seq(self, seq: int, order_uuid: str) -> None:
         """为异步下单预注册 `seq -> order_uuid` 映射。"""
@@ -470,6 +487,27 @@ class OrderManager:
     def set_trade_callback(self, callback: Callable[[TradeRecord], None]) -> None:
         """注册“成交变化 -> 其他监听方”回调，例如 WebSocket 推送。"""
         self._trade_callback = callback
+
+    def set_state_change_callback(self, callback: Callable[[str], None]) -> None:
+        """注册订单生命周期变化后的持久化回调。"""
+        self._state_change_callback = callback
+
+    def restore_orders(self, orders: List[Order]) -> None:
+        """把持久化层中的活动订单重新装载回内存索引。"""
+        with self._lock:
+            for order in orders:
+                self._orders[order.order_uuid] = order
+                if int(order.xt_order_id or 0) > 0:
+                    self._xt_to_uuid[int(order.xt_order_id)] = order.order_uuid
+
+    def _notify_state_change(self, reason: str) -> None:
+        """在订单生命周期发生变化后通知上层保存最新快照。"""
+        if not self._state_change_callback:
+            return
+        try:
+            self._state_change_callback(reason)
+        except Exception as exc:
+            logger.error("OrderManager: 状态变更回调失败: %s", exc, exc_info=True)
 
 
 __all__ = ["OrderManager"]

@@ -6,6 +6,7 @@ export const useSystemStore = defineStore('system', () => {
   // status：系统级摘要信息，用于首页状态卡片展示。
   const status = ref({ connected: false, trading_time: false,
                         strategy_count: 0, active_orders: 0,
+                        latest_data_time: '', data_delay_ms: 0, strategy_process_total_ms: 0, data_latency_threshold_sec: 0,
                         cpu_pct: 0, mem_pct: 0 })
   // positionSummary：持仓汇总统计，用于首页和总览页展示。
   const positionSummary = ref({
@@ -21,6 +22,7 @@ export const useSystemStore = defineStore('system', () => {
     total_fees: 0,
     total_pnl: 0,
   })
+  const capacitySummary = ref([])
   // realtimeTicks：按证券代码保存最新实时行情。
   const realtimeTicks = ref({})
   // recentTrades：保存最近一批成交推送，方便实时展示。
@@ -42,6 +44,13 @@ export const useSystemStore = defineStore('system', () => {
     } catch (e) { console.error(e) }
   }
 
+  async function fetchCapacitySummary() {
+    try {
+      const res = await axios.get('/api/system/capacity-summary')
+      capacitySummary.value = Array.isArray(res.data) ? res.data : []
+    } catch (e) { console.error(e) }
+  }
+
   function handleWsMessage(msg) {
     // tick 推送按证券代码覆盖，永远保留“最新一条”。
     if (msg.type === 'tick') {
@@ -60,10 +69,12 @@ export const useSystemStore = defineStore('system', () => {
   return {
     status,
     positionSummary,
+    capacitySummary,
     realtimeTicks,
     recentTrades,
     fetchStatus,
     fetchPositionSummary,
+    fetchCapacitySummary,
     handleWsMessage,
   }
 })

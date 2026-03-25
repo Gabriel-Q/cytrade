@@ -3,17 +3,21 @@
 本模块是项目中连接“行情、策略、订单、持仓、状态恢复”的调度中心。
 它不关心具体策略逻辑本身，而是负责让多个策略实例在统一规则下运行。
 """
+import json
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from typing import Dict, List, Optional, Type
 
-from config.enums import AlertLevel, StrategyStatus
+from config.enums import AlertLevel, OrderDirection, OrderStatus, OrderType, StrategyStatus
 from core.models import TickData
 from core.trading_calendar import is_market_day
+from position.manager import PositionManager
+from position.models import FifoLot, PositionInfo
 from strategy.base import BaseStrategy
 from strategy.models import StrategyConfig, StrategySnapshot
+from trading.models import Order, TradeRecord
 from monitor.logger import get_logger
 
 logger = get_logger("system")
@@ -36,10 +40,13 @@ class StrategyRunner:
     """
 
     def __init__(self, data_subscription=None, trade_executor=None,
+                 order_manager=None,
                  position_manager=None, data_manager=None,
                  connection_manager=None,
                  strategy_classes: List[Type[BaseStrategy]] = None,
                  load_previous_state_on_start: bool = True,
+                 state_autosave_interval_sec: int = 300,
+                 state_realtime_persist_min_interval_sec: float = 3.0,
                  latency_threshold_sec: float = 10.0,
                  process_threshold_ms: float = 200.0):
         """初始化策略运行器。
@@ -52,6 +59,8 @@ class StrategyRunner:
             connection_manager: 交易连接管理器，用于启动前账户校验。
             strategy_classes: 需要托管的策略类列表。
             load_previous_state_on_start: 当日状态不存在时，是否回退加载上一交易日状态。
+            state_autosave_interval_sec: 盘中自动保存状态的周期，单位秒；``0`` 表示关闭。
+            state_realtime_persist_min_interval_sec: 盘中实时状态保存的最小间隔，单位秒。
             latency_threshold_sec: 行情延迟告警阈值，单位秒。
             process_threshold_ms: 单次策略处理耗时告警阈值，单位毫秒。
         """
@@ -59,6 +68,8 @@ class StrategyRunner:
         self._data_sub = data_subscription
         # ``_trade_exec`` 负责把策略信号翻译成真实下单动作。
         self._trade_exec = trade_executor
+        # ``_order_mgr`` 用于在重启时把活动订单从持久化层重新装载回内存。
+        self._order_mgr = order_manager
         # ``_position_mgr`` 负责查询和维护策略持仓。
         self._position_mgr = position_manager
         # ``_data_mgr`` 用于保存和恢复策略状态快照。
@@ -69,6 +80,10 @@ class StrategyRunner:
         self._strategy_classes = strategy_classes or []
         # ``_load_previous_state_on_start`` 控制是否回退到上一交易日状态文件。
         self._load_previous_state_on_start = load_previous_state_on_start
+        # ``_state_autosave_interval_sec`` 控制盘中状态自动保存频率。
+        self._state_autosave_interval_sec = max(0, int(state_autosave_interval_sec or 0))
+        # ``_state_realtime_persist_min_interval_sec`` 控制纯行情态下最小保存间隔，避免每个 tick 都写快照。
+        self._state_realtime_persist_min_interval_sec = max(0.0, float(state_realtime_persist_min_interval_sec or 0.0))
         # ``_strategies`` 保存当前正在托管的策略实例列表。
         self._strategies: List[BaseStrategy] = []
         # ``_lock`` 保护策略列表在多线程环境下的增删改查。
@@ -77,10 +92,16 @@ class StrategyRunner:
         self._latency_threshold = latency_threshold_sec
         # ``_process_threshold_ms`` 是单次策略处理耗时阈值，单位毫秒。
         self._process_threshold_ms = process_threshold_ms
+        # ``_last_round_total_process_ms`` 记录最近一轮行情推送对应的策略总处理耗时。
+        self._last_round_total_process_ms = 0.0
         # ``_running`` 标记运行器是否已进入工作状态。
         self._running = False
         # ``_scheduler`` 是 APScheduler 实例，用于定时选股与保存状态。
         self._scheduler = None
+        # ``_state_save_lock`` 用于串行化事件驱动快照保存，避免多线程并发写 pickle。
+        self._state_save_lock = threading.RLock()
+        # ``_last_state_save_monotonic`` 记录最近一次成功保存的单调时钟时间。
+        self._last_state_save_monotonic = 0.0
         # ``_scheduler_thread`` 是调度器所在线程。
         self._scheduler_thread = None
         # ``_heartbeat_callback`` 用于向看门狗报告主循环活跃状态。
@@ -107,16 +128,19 @@ class StrategyRunner:
         logger.info("StrategyRunner: 启动")
 
         # 尝试恢复状态
-        if not self._load_state():
-            # 无保存状态，从选股开始
-            self.run_stock_selection()
+        self._load_state()
+
+        # 无论是否恢复出快照，都再按当日 CSV 补齐一次缺失实例。
+        # add_strategy 会按 instance_key 去重，因此不会覆盖已恢复的实例。
+        self.run_stock_selection()
+
+        # 把快照里记录的活动订单 UUID 重新装载回内存，
+        # 避免异常重启后策略忘记自己仍有挂单未完结。
+        self._restore_pending_orders_from_storage()
 
         # 在真正开始盯盘前，先核对账户资产和账户持仓，
         # 防止策略内部状态与真实账户状态明显不一致。
         self._validate_account_constraints()
-
-        # 订阅行情
-        self._subscribe_all()
 
         # 注册数据回调
         if self._data_sub:
@@ -129,6 +153,7 @@ class StrategyRunner:
         self._activate_for_trading_day(reason="startup")
 
         logger.info("StrategyRunner: 已启动 %d 个策略", len(self._strategies))
+        self.request_state_persist("runner_started")
 
     def stop(self) -> None:
         """停止运行器，并保存当前策略状态。"""
@@ -159,6 +184,11 @@ class StrategyRunner:
             if self._heartbeat_callback:
                 self._heartbeat_callback("strategy_runner")
 
+            if self._position_mgr and tick_data:
+                first_tick = next(iter(tick_data.values()), None)
+                if first_tick and getattr(first_tick, "data_time", None):
+                    self._position_mgr.unlock_available_quantities(first_tick.data_time.strftime("%Y%m%d"))
+
             # 先做统一的延迟检测，避免策略内部各自重复判断。
             for code, tick in tick_data.items():
                 if tick.latency_ms > self._latency_threshold * 1000:
@@ -168,6 +198,7 @@ class StrategyRunner:
             with self._lock:
                 strategies = list(self._strategies)
 
+            round_total_elapsed_ms = 0.0
             for strategy in strategies:
                 code = strategy.stock_code
                 tick = tick_data.get(code)
@@ -175,11 +206,13 @@ class StrategyRunner:
                     continue
                 t0 = time.perf_counter()
                 try:
+                    strategy.before_process_tick(tick)
                     strategy.process_tick(tick)
                 except Exception as e:
                     logger.error("StrategyRunner: Strategy[%s] 处理异常: %s",
                                  strategy.strategy_id[:8], e, exc_info=True)
                 elapsed_ms = (time.perf_counter() - t0) * 1000
+                round_total_elapsed_ms += elapsed_ms
                 if elapsed_ms > self._process_threshold_ms:
                     logger.warning(
                         "StrategyRunner: Strategy[%s] 处理耗时 %.1fms 超过阈值 %.1fms",
@@ -188,6 +221,8 @@ class StrategyRunner:
                 else:
                     logger.debug("StrategyRunner: Strategy[%s] 耗时 %.1fms",
                                  strategy.strategy_id[:8], elapsed_ms)
+
+            self._last_round_total_process_ms = round_total_elapsed_ms
 
             # 每轮行情结束后顺手清理已停止策略，
             # 可以避免策略列表持续膨胀。
@@ -198,39 +233,57 @@ class StrategyRunner:
 
     # ------------------------------------------------------------------ 策略管理
 
+    @staticmethod
+    def _strategy_instance_key(strategy: BaseStrategy) -> tuple[str, str]:
+        """返回用于判断策略实例是否重复的唯一键。"""
+        params = getattr(strategy.config, "params", {}) or {}
+        instance_key = str(params.get("instance_key") or strategy.stock_code)
+        return strategy.strategy_name, instance_key
+
+    def get_last_round_total_process_ms(self) -> float:
+        """返回最近一轮行情推送对应的策略总处理耗时，单位毫秒。"""
+        return float(self._last_round_total_process_ms or 0.0)
+
     def add_strategy(self, strategy: BaseStrategy) -> None:
         """向运行器中添加一个策略实例。"""
+        strategy.bind_persistence(self._data_mgr, self.request_state_persist)
+        strategy_key = self._strategy_instance_key(strategy)
         with self._lock:
             exists = next(
                 (
                     s for s in self._strategies
-                    if s.strategy_name == strategy.strategy_name
-                    and s.stock_code == strategy.stock_code
+                    if self._strategy_instance_key(s) == strategy_key
                     and s.status != StrategyStatus.STOPPED
                 ),
                 None,
             )
             if exists:
                 logger.info(
-                    "StrategyRunner: 跳过重复策略 %s stock=%s",
+                    "StrategyRunner: 跳过重复策略 %s stock=%s key=%s",
                     strategy.strategy_name,
                     strategy.stock_code,
+                    strategy_key[1],
                 )
                 return
 
             self._strategies.append(strategy)
 
-        if self._running and self.is_trading_day() and strategy.status == StrategyStatus.INITIALIZING:
-            strategy.start()
+        is_trading_day = self._running and self.is_trading_day()
+        if is_trading_day:
+            self._prepare_strategy_for_trading_day(strategy)
+            if strategy.status == StrategyStatus.INITIALIZING:
+                strategy.start()
 
         logger.info("StrategyRunner: 添加策略 %s stock=%s",
                     strategy.strategy_name, strategy.stock_code)
         with self._lock:
-            should_subscribe = self._running and self.is_trading_day()
+            should_subscribe = is_trading_day
 
         # 订阅该标的
         if self._data_sub and should_subscribe:
             self._data_sub.subscribe_stocks([strategy.stock_code])
+        if self._running:
+            self.request_state_persist(f"add_strategy:{strategy.strategy_id}")
 
     def remove_strategy(self, strategy_id: str) -> None:
         """按策略 ID 移除策略实例。"""
@@ -251,6 +304,34 @@ class StrategyRunner:
         """返回当前全部策略对象的副本列表。"""
         with self._lock:
             return list(self._strategies)
+
+    def get_paused_strategy_reconciliation(self) -> List[dict]:
+        """返回暂停策略的持仓对账视图。"""
+        account_position_map = self._build_account_position_map()
+        rows: List[dict] = []
+
+        with self._lock:
+            strategies = list(self._strategies)
+
+        for strategy in strategies:
+            if strategy.status != StrategyStatus.PAUSED:
+                continue
+
+            position = self._position_mgr.get_position(strategy.strategy_id) if self._position_mgr else None
+            account_position = account_position_map.get(strategy.stock_code, {})
+            rows.append({
+                "strategy_id": strategy.strategy_id,
+                "strategy_name": strategy.strategy_name,
+                "stock_code": strategy.stock_code,
+                "pause_reason": strategy.get_pause_reason(),
+                "strategy_total_quantity": int(getattr(position, "total_quantity", 0) or 0),
+                "strategy_available_quantity": int(getattr(position, "available_quantity", 0) or 0),
+                "account_total_quantity": int(account_position.get("volume", 0) or 0),
+                "account_available_quantity": int(account_position.get("can_use_volume", 0) or 0),
+            })
+
+        rows.sort(key=lambda item: (item["stock_code"], item["strategy_name"], item["strategy_id"]))
+        return rows
 
     # ------------------------------------------------------------------ 选股
 
@@ -291,15 +372,67 @@ class StrategyRunner:
         """保存全部策略的快照状态。"""
         if not self._data_mgr:
             return
-        try:
-            with self._lock:
-                snapshots = [
-                    s.get_snapshot() for s in self._strategies
-                    if s.status != StrategyStatus.STOPPED
-                ]
-            self._data_mgr.save_strategy_state(snapshots)
-        except Exception as e:
-            logger.error("StrategyRunner: 保存状态失败: %s", e, exc_info=True)
+        with self._state_save_lock:
+            try:
+                with self._lock:
+                    for strategy in self._strategies:
+                        prepare_for_persist = getattr(strategy, "prepare_for_persist", None)
+                        if callable(prepare_for_persist):
+                            prepare_for_persist()
+                    snapshots = [
+                        s.get_snapshot() for s in self._strategies
+                        if bool(getattr(s, "should_persist_state", lambda: s.status != StrategyStatus.STOPPED)())
+                    ]
+
+                strategy_classes = {type(s) for s in self._strategies}
+                strategy_classes.update(self._strategy_classes or [])
+                class_states = []
+                for cls in strategy_classes:
+                    export_state = getattr(cls, "persistent_class_state", None)
+                    if not callable(export_state):
+                        continue
+                    state = export_state() or {}
+                    if not state:
+                        continue
+                    class_states.append({
+                        "strategy_type": str(getattr(cls, "strategy_name", cls.__name__) or cls.__name__),
+                        "state_version": int(getattr(cls, "state_version", 1) or 1),
+                        "state": state,
+                    })
+
+                self._data_mgr.save_strategy_runtime_states(snapshots, class_states)
+                self._last_state_save_monotonic = time.monotonic()
+            except Exception as e:
+                logger.error("StrategyRunner: 保存状态失败: %s", e, exc_info=True)
+
+    def rebuild_runtime_state(self) -> dict:
+        """清空 SQLite 运行态并立即按当前内存策略重建。"""
+        if not self._data_mgr:
+            return {"removed": 0, "persisted": 0}
+
+        with self._lock:
+            persisted = sum(
+                1
+                for strategy in self._strategies
+                if bool(getattr(strategy, "should_persist_state", lambda: strategy.status != StrategyStatus.STOPPED)())
+            )
+
+        removed = int(self._data_mgr.clear_all_strategy_runtime_states() or 0)
+        self.save_state()
+        return {"removed": removed, "persisted": persisted}
+
+    def request_state_persist(self, reason: str = "", min_interval_sec: float = 0.0) -> None:
+        """在关键运行事件后立即保存策略快照。"""
+        if not self._data_mgr:
+            return
+        interval_limit = max(0.0, float(min_interval_sec or 0.0))
+        if interval_limit > 0 and self._last_state_save_monotonic > 0:
+            elapsed = time.monotonic() - self._last_state_save_monotonic
+            if elapsed < interval_limit:
+                return
+        if reason:
+            logger.debug("StrategyRunner: 触发实时持久化 [%s]", reason)
+        self.save_state()
 
     def _load_state(self) -> bool:
         """加载历史策略状态。
@@ -309,9 +442,28 @@ class StrategyRunner:
         """
         if not self._data_mgr:
             return False
-        snapshots = self._data_mgr.load_strategy_state(
+        runtime_bundle = self._data_mgr.load_strategy_runtime_states(
             fallback_previous_market_day=self._load_previous_state_on_start,
         )
+        snapshots = []
+        if runtime_bundle:
+            for class_state in runtime_bundle.get("class_states", []) or []:
+                cls = self._find_strategy_class(str(class_state.get("strategy_type", "") or ""))
+                if not cls:
+                    logger.warning(
+                        "StrategyRunner: 未找到策略类 %s，跳过共享状态恢复",
+                        class_state.get("strategy_type", ""),
+                    )
+                    continue
+                restore_class_state = getattr(cls, "restore_persistent_class_state", None)
+                if callable(restore_class_state):
+                    restore_class_state(dict(class_state.get("state") or {}))
+            snapshots = list(runtime_bundle.get("instance_states", []) or [])
+
+        if not snapshots:
+            snapshots = self._data_mgr.load_strategy_state(
+                fallback_previous_market_day=self._load_previous_state_on_start,
+            )
         if not snapshots:
             return False
         with self._lock:
@@ -325,11 +477,215 @@ class StrategyRunner:
                                snap.strategy_name)
                 continue
             strategy = cls(snap.config, self._trade_exec, self._position_mgr)
+            strategy.bind_persistence(self._data_mgr, self.request_state_persist)
             strategy.restore_from_snapshot(snap)
+            self._restore_position_from_trades_if_available(strategy)
+            self._restore_position_from_storage_if_needed(strategy, snap)
             with self._lock:
                 self._strategies.append(strategy)
+
+        loaded_trade_day = str(getattr(self._data_mgr, "_last_loaded_state_day", "") or "")
+        current_trade_day = datetime.now().strftime("%Y%m%d")
+        if self._position_mgr and loaded_trade_day and loaded_trade_day == current_trade_day:
+            # 同一交易日内重启时，快照中的 available_quantity 已经代表当日真实状态，
+            # 不应在首个 tick 到来时再次执行“新交易日解锁”。
+            self._position_mgr.mark_trade_day_processed(current_trade_day)
+
         logger.info("StrategyRunner: 从快照恢复 %d 个策略", len(self._strategies))
         return len(self._strategies) > 0
+
+    @staticmethod
+    def _has_open_position(position: Optional[PositionInfo]) -> bool:
+        """判断持仓对象是否代表非零持仓。"""
+        return bool(position and int(getattr(position, "total_quantity", 0) or 0) > 0)
+
+    def _restore_position_from_storage_if_needed(self, strategy: BaseStrategy, snapshot: StrategySnapshot) -> None:
+        """当快照中的持仓为空时，使用 SQLite 持仓快照兜底恢复。"""
+        if not self._position_mgr or not self._data_mgr:
+            return
+        live_position = self._position_mgr.get_position(strategy.strategy_id)
+        if self._has_open_position(live_position):
+            return
+        snapshot_position = getattr(snapshot, "position", None)
+        if self._has_open_position(snapshot_position):
+            return
+
+        rows = self._data_mgr.query_positions(strategy_id=strategy.strategy_id, include_closed=True)
+        if not rows:
+            return
+
+        position = self._position_from_storage_row(rows[0])
+        if not self._has_open_position(position):
+            return
+
+        self._position_mgr.restore_position(strategy.strategy_id, position)
+        logger.info(
+            "StrategyRunner: Strategy[%s] 使用 SQLite 持仓兜底恢复 qty=%d price=%.3f",
+            strategy.strategy_id[:8],
+            position.total_quantity,
+            position.current_price,
+        )
+
+    def _restore_position_from_trades_if_available(self, strategy: BaseStrategy) -> None:
+        """当策略存在成交历史时，按成交回放重建持仓与可卖数量。"""
+        if not self._position_mgr or not self._data_mgr:
+            return
+
+        rows = self._data_mgr.query_trades(strategy_id=strategy.strategy_id)
+        if not rows:
+            return
+
+        rebuilt = self._rebuild_position_from_trade_rows(rows)
+        if not rebuilt:
+            return
+
+        rebuilt.strategy_id = strategy.strategy_id
+        rebuilt.strategy_name = strategy.strategy_name
+        rebuilt.stock_code = strategy.stock_code
+        self._position_mgr.restore_position(strategy.strategy_id, rebuilt)
+        logger.info(
+            "StrategyRunner: Strategy[%s] 使用成交回放恢复持仓 qty=%d available=%d",
+            strategy.strategy_id[:8],
+            rebuilt.total_quantity,
+            rebuilt.available_quantity,
+        )
+
+    def _rebuild_position_from_trade_rows(self, rows: List[dict]) -> Optional[PositionInfo]:
+        """按单策略成交记录回放重建持仓。"""
+        if not rows:
+            return None
+
+        cost_method = getattr(getattr(self._position_mgr, "_cost_method", None), "value", "moving_average")
+        fee_schedule = getattr(self._position_mgr, "_fee_schedule", None)
+        temp_mgr = PositionManager(cost_method=cost_method, fee_schedule=fee_schedule)
+
+        current_day = ""
+        sorted_rows = sorted(
+            rows,
+            key=lambda row: (
+                self._trade_day_from_row(row),
+                int(row.get("traded_time", 0) or 0),
+                str(row.get("trade_id", "") or ""),
+            ),
+        )
+
+        strategy_id = str(sorted_rows[0].get("strategy_id", "") or "")
+        for row in sorted_rows:
+            trade_day = self._trade_day_from_row(row)
+            if trade_day and trade_day != current_day:
+                temp_mgr.unlock_available_quantities(trade_day)
+                current_day = trade_day
+            temp_mgr.on_trade_callback(self._trade_from_storage_row(row))
+
+        return temp_mgr.get_position(strategy_id)
+
+    @staticmethod
+    def _trade_day_from_row(row: dict) -> str:
+        """从成交记录中提取交易日，统一成 YYYYMMDD。"""
+        for field in ("traded_time", "trade_time"):
+            digits = "".join(ch for ch in str(row.get(field, "") or "") if ch.isdigit())
+            if len(digits) < 8:
+                continue
+            if len(digits) in (10, 13):
+                try:
+                    ts = int(digits)
+                    if len(digits) == 13:
+                        ts = ts / 1000
+                    return datetime.fromtimestamp(ts).strftime("%Y%m%d")
+                except (TypeError, ValueError, OSError):
+                    continue
+            trade_day = digits[:8]
+            if trade_day.startswith(("19", "20")):
+                return trade_day
+        return ""
+
+    @staticmethod
+    def _trade_from_storage_row(row: dict) -> TradeRecord:
+        """把数据库成交记录反序列化为 TradeRecord。"""
+        direction = OrderDirection(str(row.get("direction", OrderDirection.BUY.value) or OrderDirection.BUY.value))
+        trade_time = StrategyRunner._parse_db_datetime(row.get("trade_time"))
+        return TradeRecord(
+            account_type=int(row.get("account_type", 0) or 0),
+            account_id=str(row.get("account_id", "") or ""),
+            order_type=int(row.get("order_type", 0) or 0),
+            trade_id=str(row.get("trade_id", "") or ""),
+            xt_traded_time=int(row.get("traded_time", 0) or 0),
+            order_uuid=str(row.get("order_uuid", "") or ""),
+            xt_order_id=int(row.get("xt_order_id", 0) or 0),
+            order_sysid=str(row.get("order_sysid", "") or ""),
+            strategy_id=str(row.get("strategy_id", "") or ""),
+            strategy_name=str(row.get("strategy_name", "") or ""),
+            order_remark=str(row.get("order_remark", "") or ""),
+            stock_code=str(row.get("stock_code", "") or ""),
+            direction=direction,
+            xt_direction=int(row.get("xt_direction", 0) or 0),
+            offset_flag=int(row.get("offset_flag", 0) or 0),
+            price=float(row.get("price", 0.0) or 0.0),
+            quantity=int(row.get("quantity", 0) or 0),
+            amount=float(row.get("amount", 0.0) or 0.0),
+            commission=float(row.get("commission", 0.0) or 0.0),
+            buy_commission=float(row.get("buy_commission", 0.0) or 0.0),
+            sell_commission=float(row.get("sell_commission", 0.0) or 0.0),
+            stamp_tax=float(row.get("stamp_tax", 0.0) or 0.0),
+            total_fee=float(row.get("total_fee", row.get("commission", 0.0)) or 0.0),
+            is_t0=bool(row.get("is_t0", 0)),
+            secu_account=str(row.get("secu_account", "") or ""),
+            instrument_name=str(row.get("instrument_name", "") or ""),
+            trade_time=trade_time,
+        )
+
+    @staticmethod
+    def _position_from_storage_row(row: dict) -> PositionInfo:
+        """把 SQLite 持仓记录转换成 PositionInfo。"""
+        fifo_lots = []
+        raw_fifo = str(row.get("fifo_lots_json", "") or "").strip()
+        if raw_fifo:
+            try:
+                for lot in json.loads(raw_fifo):
+                    buy_time_text = str(lot.get("buy_time", "") or "").strip()
+                    if buy_time_text:
+                        try:
+                            buy_time = datetime.fromisoformat(buy_time_text.replace("Z", "+00:00"))
+                        except ValueError:
+                            buy_time = datetime.now()
+                    else:
+                        buy_time = datetime.now()
+                    fifo_lots.append(FifoLot(
+                        quantity=int(lot.get("quantity", 0) or 0),
+                        cost_price=float(lot.get("cost_price", 0.0) or 0.0),
+                        buy_time=buy_time,
+                    ))
+            except Exception:
+                fifo_lots = []
+
+        update_time_text = str(row.get("update_time", "") or "").strip()
+        try:
+            update_time = datetime.fromisoformat(update_time_text.replace(" ", "T")) if update_time_text else datetime.now()
+        except ValueError:
+            update_time = datetime.now()
+
+        return PositionInfo(
+            strategy_id=str(row.get("strategy_id", "") or ""),
+            strategy_name=str(row.get("strategy_name", "") or ""),
+            stock_code=str(row.get("stock_code", "") or ""),
+            total_quantity=int(row.get("total_quantity", 0) or 0),
+            available_quantity=int(row.get("available_quantity", 0) or 0),
+            is_t0=bool(row.get("is_t0", 0)),
+            avg_cost=float(row.get("avg_cost", 0.0) or 0.0),
+            total_cost=float(row.get("total_cost", 0.0) or 0.0),
+            current_price=float(row.get("current_price", 0.0) or 0.0),
+            market_value=float(row.get("market_value", 0.0) or 0.0),
+            unrealized_pnl=float(row.get("unrealized_pnl", 0.0) or 0.0),
+            unrealized_pnl_ratio=float(row.get("unrealized_pnl_ratio", 0.0) or 0.0),
+            realized_pnl=float(row.get("realized_pnl", 0.0) or 0.0),
+            total_commission=float(row.get("total_commission", 0.0) or 0.0),
+            total_buy_commission=float(row.get("total_buy_commission", 0.0) or 0.0),
+            total_sell_commission=float(row.get("total_sell_commission", 0.0) or 0.0),
+            total_stamp_tax=float(row.get("total_stamp_tax", 0.0) or 0.0),
+            total_fees=float(row.get("total_fees", 0.0) or 0.0),
+            fifo_lots=fifo_lots,
+            update_time=update_time,
+        )
 
     def _find_strategy_class(self, strategy_name: str) -> Optional[Type[BaseStrategy]]:
         """根据策略名称找到对应的策略类。"""
@@ -357,6 +713,10 @@ class StrategyRunner:
             # 收盘后保存状态
             self._scheduler.add_job(self.save_state, "cron",
                                     hour=15, minute=5, id="save_state")
+            if self._state_autosave_interval_sec > 0:
+                self._scheduler.add_job(self._autosave_state, "interval",
+                                        seconds=self._state_autosave_interval_sec,
+                                        id="autosave_state")
             # 每30分钟清理已停止策略
             self._scheduler.add_job(self._cleanup_stopped, "interval",
                                     minutes=30, id="cleanup")
@@ -371,6 +731,12 @@ class StrategyRunner:
             logger.warning("StrategyRunner: apscheduler 未安装，跳过定时任务")
         except Exception as e:
             logger.error("StrategyRunner: 调度器启动失败: %s", e, exc_info=True)
+
+    def _autosave_state(self) -> None:
+        """盘中周期保存状态，降低异常退出导致的持仓丢失风险。"""
+        if not self._running or not self.is_trading_day():
+            return
+        self.save_state()
 
     def is_trading_time(self) -> bool:
         """判断当前是否位于日内交易时段。"""
@@ -391,6 +757,7 @@ class StrategyRunner:
             logger.info("StrategyRunner: 今日非交易日，跳过策略激活 [%s]", reason or "unknown")
             return False
 
+        self._prepare_all_strategies_for_trading_day(reason=reason)
         self._subscribe_all()
 
         started = 0
@@ -404,6 +771,41 @@ class StrategyRunner:
                     reason or "unknown", started)
         return True
 
+    def _prepare_all_strategies_for_trading_day(self, reason: str = "") -> None:
+        """在统一订阅前，先完成所有策略的交易日预初始化。"""
+        trade_day = datetime.now().strftime("%Y%m%d")
+        with self._lock:
+            strategies = list(self._strategies)
+
+        prepared = 0
+        failed = 0
+        for strategy in strategies:
+            if self._prepare_strategy_for_trading_day(strategy, trade_day=trade_day):
+                prepared += 1
+            else:
+                failed += 1
+
+        logger.info(
+            "StrategyRunner: 交易日前初始化完成 [%s]，成功 %d，失败 %d",
+            reason or "unknown",
+            prepared,
+            failed,
+        )
+
+    def _prepare_strategy_for_trading_day(self, strategy: BaseStrategy, trade_day: str = "") -> bool:
+        """为单个策略执行交易日前初始化。"""
+        target_trade_day = trade_day or datetime.now().strftime("%Y%m%d")
+        try:
+            return bool(strategy.prepare_for_trading_day(target_trade_day))
+        except Exception as exc:
+            logger.error(
+                "StrategyRunner: Strategy[%s] 交易日前初始化失败: %s",
+                strategy.strategy_id[:8],
+                exc,
+                exc_info=True,
+            )
+            return False
+
     def _subscribe_all(self) -> None:
         """订阅当前所有策略涉及的证券代码。"""
         if not self._data_sub:
@@ -413,6 +815,131 @@ class StrategyRunner:
             codes = list({s.stock_code for s in self._strategies})
         if codes:
             self._data_sub.subscribe_stocks(codes)
+
+    def _restore_pending_orders_from_storage(self) -> int:
+        """从 SQLite 重建快照中记录的活动订单。"""
+        if not self._data_mgr or not self._order_mgr:
+            return 0
+
+        with self._lock:
+            strategies = list(self._strategies)
+
+        pending_order_ids = sorted({
+            order_uuid
+            for strategy in strategies
+            for order_uuid in strategy.get_pending_order_recovery_ids()
+            if order_uuid
+        })
+        if not pending_order_ids:
+            return 0
+
+        rows = self._data_mgr.query_orders(order_uuids=pending_order_ids)
+        if not rows:
+            logger.warning("StrategyRunner: 快照记录了 %d 个活动订单，但数据库未找到对应记录", len(pending_order_ids))
+            return 0
+
+        restored_orders: Dict[str, Order] = {}
+        active_statuses = {
+            OrderStatus.UNREPORTED.value,
+            OrderStatus.WAIT_REPORTING.value,
+            OrderStatus.REPORTED.value,
+            OrderStatus.REPORTED_CANCEL.value,
+            OrderStatus.PARTSUCC_CANCEL.value,
+            OrderStatus.PART_SUCC.value,
+        }
+        for row in rows:
+            if str(row.get("status", "") or "") not in active_statuses:
+                continue
+            order = self._deserialize_order_row(row)
+            if order.is_active():
+                restored_orders[order.order_uuid] = order
+
+        if not restored_orders:
+            return 0
+
+        self._order_mgr.restore_orders(list(restored_orders.values()))
+
+        restored_count = 0
+        for strategy in strategies:
+            orders = [
+                restored_orders[order_uuid]
+                for order_uuid in strategy.get_pending_order_recovery_ids()
+                if order_uuid in restored_orders
+            ]
+            if not orders:
+                continue
+            strategy.restore_pending_orders(orders)
+            restored_count += len(orders)
+
+        if restored_count > 0:
+            logger.info("StrategyRunner: 已从持久化订单恢复 %d 个活动订单", restored_count)
+        return restored_count
+
+    @staticmethod
+    def _deserialize_order_row(row: dict) -> Order:
+        """把数据库行反序列化成内部 Order 对象。"""
+        return Order(
+            order_uuid=str(row.get("order_uuid", "") or ""),
+            strategy_id=str(row.get("strategy_id", "") or ""),
+            strategy_name=str(row.get("strategy_name", "") or ""),
+            stock_code=str(row.get("stock_code", "") or ""),
+            direction=OrderDirection(str(row.get("direction", OrderDirection.BUY.value) or OrderDirection.BUY.value)),
+            order_type=OrderType(str(row.get("order_type", OrderType.LIMIT.value) or OrderType.LIMIT.value)),
+            price=float(row.get("price", 0.0) or 0.0),
+            quantity=int(row.get("quantity", 0) or 0),
+            amount=float(row.get("amount", 0.0) or 0.0),
+            status=OrderStatus(str(row.get("status", OrderStatus.UNKNOWN.value) or OrderStatus.UNKNOWN.value)),
+            filled_quantity=int(row.get("filled_quantity", 0) or 0),
+            filled_amount=float(row.get("filled_amount", 0.0) or 0.0),
+            filled_avg_price=float(row.get("filled_avg_price", 0.0) or 0.0),
+            xt_order_id=int(row.get("xt_order_id", 0) or 0),
+            account_type=int(row.get("account_type", 0) or 0),
+            account_id=str(row.get("account_id", "") or ""),
+            xt_stock_code=str(row.get("xt_stock_code", "") or ""),
+            order_sysid=str(row.get("order_sysid", "") or ""),
+            order_time=int(row.get("order_time", 0) or 0),
+            xt_order_type=int(row.get("xt_order_type", 0) or 0),
+            price_type=int(row.get("price_type", 0) or 0),
+            xt_order_status=int(row.get("xt_order_status", 0) or 0),
+            status_msg=str(row.get("status_msg", "") or ""),
+            xt_direction=int(row.get("xt_direction", 0) or 0),
+            offset_flag=int(row.get("offset_flag", 0) or 0),
+            secu_account=str(row.get("secu_account", "") or ""),
+            instrument_name=str(row.get("instrument_name", "") or ""),
+            xt_fields=dict(StrategyRunner._safe_json_loads(str(row.get("xt_order_snapshot", "") or ""))),
+            remark=str(row.get("remark", "") or ""),
+            commission=float(row.get("commission", 0.0) or 0.0),
+            buy_commission=float(row.get("buy_commission", 0.0) or 0.0),
+            sell_commission=float(row.get("sell_commission", 0.0) or 0.0),
+            stamp_tax=float(row.get("stamp_tax", 0.0) or 0.0),
+            total_fee=float(row.get("total_fee", 0.0) or 0.0),
+            create_time=StrategyRunner._parse_db_datetime(row.get("create_time")),
+            update_time=StrategyRunner._parse_db_datetime(row.get("update_time")),
+        )
+
+    @staticmethod
+    def _parse_db_datetime(value) -> datetime:
+        """把 SQLite 时间字段解析为 datetime。"""
+        text = str(value or "").strip()
+        if not text:
+            return datetime.now()
+        for candidate in (text, text.replace(" ", "T")):
+            try:
+                return datetime.fromisoformat(candidate)
+            except ValueError:
+                continue
+        return datetime.now()
+
+    @staticmethod
+    def _safe_json_loads(raw: str) -> dict:
+        """安全解析订单快照 JSON。"""
+        import json
+
+        try:
+            data = json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
 
     def _cleanup_stopped(self) -> None:
         """移除已停止且无持仓的策略，同时归档盈亏"""
@@ -437,12 +964,40 @@ class StrategyRunner:
         removed = len(removed_ids)
         if removed:
             logger.info("StrategyRunner: 清理并归档 %d 个已停止策略", removed)
+            self.request_state_persist("cleanup_stopped")
 
     def dispatch_order_update(self, order) -> None:
         """将订单更新分发给对应策略"""
         strategy = self.get_strategy(order.strategy_id)
         if strategy:
             strategy.on_order_update(order)
+
+    def _build_account_position_map(self) -> Dict[str, Dict[str, int]]:
+        """查询并标准化账户持仓映射。"""
+        if not self._connection_mgr or not self._connection_mgr.is_connected():
+            return {}
+
+        try:
+            account_positions = self._connection_mgr.query_stock_positions()
+        except Exception as exc:
+            logger.warning("StrategyRunner: 查询账户持仓失败，暂停对账视图返回空结果: %s", exc)
+            return {}
+
+        account_position_map: Dict[str, Dict[str, int]] = {}
+        for account_position in account_positions:
+            code = self._xt_to_code(str(getattr(account_position, "stock_code", "") or ""))
+            volume = int(getattr(account_position, "volume", 0) or 0)
+            can_use_volume = int(getattr(account_position, "can_use_volume", 0) or 0)
+            on_road_volume = int(getattr(account_position, "on_road_volume", 0) or 0)
+            yesterday_volume = int(getattr(account_position, "yesterday_volume", 0) or 0)
+            account_position_map[code] = {
+                "volume": volume,
+                "can_use_volume": can_use_volume,
+                "on_road_volume": on_road_volume,
+                "yesterday_volume": yesterday_volume,
+                "total_with_on_road": max(volume, yesterday_volume + on_road_volume),
+            }
+        return account_position_map
 
     def _validate_account_constraints(self) -> None:
         """在策略运行前核对账户资产和账户持仓。
@@ -459,7 +1014,7 @@ class StrategyRunner:
             return
 
         account_asset = self._connection_mgr.query_stock_asset()
-        account_positions = self._connection_mgr.query_stock_positions()
+        account_position_map = self._build_account_position_map()
 
         if account_asset is None:
             self._warn_preflight("[启动前校验] 无法获取账户资产信息，已跳过资金上限核验")
@@ -467,6 +1022,8 @@ class StrategyRunner:
 
         available_cash = float(getattr(account_asset, "cash", 0.0) or 0.0)
         total_asset = float(getattr(account_asset, "total_asset", 0.0) or 0.0)
+
+        self._sync_position_availability_with_account(account_position_map)
 
         with self._lock:
             strategies = list(self._strategies)
@@ -505,19 +1062,13 @@ class StrategyRunner:
             if isinstance(cast_names, set):
                 cast_names.add(position.strategy_name)
 
-        account_position_map: Dict[str, Dict[str, int]] = {}
-        for account_position in account_positions:
-            code = self._xt_to_code(str(getattr(account_position, "stock_code", "") or ""))
-            account_position_map[code] = {
-                "volume": int(getattr(account_position, "volume", 0) or 0),
-                "can_use_volume": int(getattr(account_position, "can_use_volume", 0) or 0),
-            }
-
         for stock_code, info in strategy_position_map.items():
             strategy_total = int(info.get("total_quantity", 0) or 0)
             strategy_available = int(info.get("available_quantity", 0) or 0)
             strategy_names = ",".join(sorted(info.get("strategy_names", set()) or []))
             account_position = account_position_map.get(stock_code)
+            account_volume = int((account_position or {}).get("total_with_on_road", 0) or 0)
+            account_available = int((account_position or {}).get("can_use_volume", 0) or 0)
 
             if strategy_total <= 0 and strategy_available <= 0:
                 continue
@@ -527,19 +1078,123 @@ class StrategyRunner:
                     f"[启动前校验] 策略持仓显示 {stock_code} 共 {strategy_total} 股，"
                     f"但账户中未查询到该标的持仓（策略: {strategy_names or '-' }）"
                 )
+                self._pause_strategies_for_stock(stock_code, "账户未查询到对应持仓")
                 continue
 
-            if strategy_total > int(account_position.get("volume", 0) or 0):
+            if strategy_total > account_volume:
                 self._warn_preflight(
                     f"[启动前校验] 策略持仓 {stock_code} 共 {strategy_total} 股，"
-                    f"超过账户实际持仓 {account_position['volume']} 股（策略: {strategy_names or '-' }）"
+                    f"超过账户实际持仓 {account_volume} 股（策略: {strategy_names or '-' }）"
                 )
+                self._pause_strategies_for_stock(stock_code, "策略持仓超过账户实际持仓")
 
-            if strategy_available > int(account_position.get("can_use_volume", 0) or 0):
+            if strategy_available > account_available:
                 self._warn_preflight(
                     f"[启动前校验] 策略可用持仓 {stock_code} 共 {strategy_available} 股，"
-                    f"超过账户实际可用持仓 {account_position['can_use_volume']} 股（策略: {strategy_names or '-' }）"
+                    f"超过账户实际可用持仓 {account_available} 股（策略: {strategy_names or '-' }）"
                 )
+                self._pause_strategies_for_stock(stock_code, "策略可用持仓超过账户实际可用持仓")
+
+    def _sync_position_availability_with_account(self, account_position_map: Dict[str, Dict[str, int]]) -> None:
+        """按账户真实可用持仓压降策略侧 available_quantity。"""
+        if not self._position_mgr:
+            return
+
+        grouped_positions: Dict[str, List[PositionInfo]] = {}
+        for position in self._position_mgr.get_all_positions().values():
+            if not self._position_mgr._is_managed_position(position):
+                continue
+            if int(position.total_quantity or 0) <= 0:
+                continue
+            grouped_positions.setdefault(position.stock_code, []).append(position)
+
+        changed = False
+        for stock_code, positions in grouped_positions.items():
+            account_position = account_position_map.get(stock_code)
+            if not account_position:
+                continue
+            allocations = self._allocate_strategy_available_quantities(
+                positions,
+                int(account_position.get("can_use_volume", 0) or 0),
+            )
+            for position in positions:
+                assigned_available = allocations.get(position.strategy_id, 0)
+                changed = self._position_mgr.sync_available_quantity(position.strategy_id, assigned_available) or changed
+
+        if changed:
+            logger.info("StrategyRunner: 已按账户可用持仓同步策略可卖数量")
+            self.request_state_persist("sync_available_with_account")
+
+    @staticmethod
+    def _allocate_strategy_available_quantities(
+        positions: List[PositionInfo],
+        account_available: int,
+    ) -> Dict[str, int]:
+        """按账户可用上限压降同一标的多个策略的可卖数量。"""
+        valid_positions = [pos for pos in positions if int(getattr(pos, "total_quantity", 0) or 0) > 0]
+        if not valid_positions:
+            return {}
+
+        current_available_map = {
+            str(pos.strategy_id or ""): min(
+                max(0, int(getattr(pos, "available_quantity", 0) or 0)),
+                max(0, int(getattr(pos, "total_quantity", 0) or 0)),
+            )
+            for pos in valid_positions
+        }
+        distributable = max(0, int(account_available or 0))
+        strategy_available_total = sum(current_available_map.values())
+
+        if strategy_available_total <= distributable:
+            return current_available_map
+        if distributable <= 0:
+            return {str(pos.strategy_id): 0 for pos in valid_positions}
+
+        allocations: Dict[str, int] = {}
+        remainders: List[tuple[float, str]] = []
+        assigned_total = 0
+        for pos in valid_positions:
+            strategy_id = str(pos.strategy_id or "")
+            position_available = current_available_map.get(strategy_id, 0)
+            raw_share = distributable * position_available / strategy_available_total
+            assigned = min(position_available, int(raw_share))
+            allocations[strategy_id] = assigned
+            assigned_total += assigned
+            remainders.append((raw_share - int(raw_share), strategy_id))
+
+        leftover = distributable - assigned_total
+        for _, strategy_id in sorted(remainders, reverse=True):
+            if leftover <= 0:
+                break
+            position = next((pos for pos in valid_positions if str(pos.strategy_id or "") == strategy_id), None)
+            if not position:
+                continue
+            max_allowed = current_available_map.get(strategy_id, 0)
+            if allocations[strategy_id] >= max_allowed:
+                continue
+            allocations[strategy_id] += 1
+            leftover -= 1
+
+        return allocations
+
+    def _pause_strategies_for_stock(self, stock_code: str, reason: str) -> None:
+        """当账户持仓约束不满足时，暂停相关策略以避免继续发出错误交易指令。"""
+        paused_ids = []
+        with self._lock:
+            for strategy in self._strategies:
+                if strategy.stock_code != stock_code:
+                    continue
+                if strategy.status == StrategyStatus.STOPPED:
+                    continue
+                strategy.pause(reason=reason)
+                paused_ids.append(strategy.strategy_id[:8])
+        if paused_ids:
+            logger.warning(
+                "StrategyRunner: 因账户仓位校验失败暂停 %s 的 %d 个策略实例 [%s]",
+                stock_code,
+                len(paused_ids),
+                reason,
+            )
 
     def _warn_preflight(self, message: str) -> None:
         """统一处理启动前校验警告：同时写日志并发送告警。"""

@@ -53,12 +53,17 @@ class BacktestTracker:
 
     def capture_equity(self, data_time: datetime, cash: float, market_value: float) -> None:
         """记录一个净值时点。"""
+        self.capture_equity_with_cost(data_time=data_time, cash=cash, market_value=market_value, invested_capital=0.0)
+
+    def capture_equity_with_cost(self, data_time: datetime, cash: float, market_value: float, invested_capital: float) -> None:
+        """记录一个净值时点，并保留当时已投入的总成本。"""
         equity = float(cash) + float(market_value)
         self._equity_curve.append(
             EquityPoint(
                 data_time=data_time,
                 cash=float(cash),
                 market_value=float(market_value),
+                invested_capital=float(invested_capital),
                 equity=equity,
                 drawdown=0.0,
             )
@@ -68,13 +73,15 @@ class BacktestTracker:
         """汇总回测结果。"""
         equity_curve = self._build_drawdown_curve()
         daily_returns = self._build_daily_returns(equity_curve)
+        benchmark_daily_returns = self._build_benchmark_daily_returns(daily_returns)
         trade_stats = self._build_trade_statistics()
-        metrics = self._build_metrics(equity_curve, daily_returns, trade_stats)
+        metrics = self._build_metrics(equity_curve, daily_returns, benchmark_daily_returns, trade_stats)
         return BacktestResult(
             config=self._config,
             metrics=metrics,
             equity_curve=equity_curve,
             daily_returns=daily_returns,
+            benchmark_daily_returns=benchmark_daily_returns,
             closed_trades=trade_stats["closed_trades"],
             orders=[self._serialize_order(order) for order in self._orders],
             trades=[self._serialize_trade(trade) for trade in self._trades],
@@ -85,14 +92,16 @@ class BacktestTracker:
         peak = 0.0
         points: List[EquityPoint] = []
         for point in self._equity_curve:
-            peak = max(peak, point.equity)
-            drawdown = 0.0 if peak <= 0 else (peak - point.equity) / peak
+            adjusted_equity = point.equity
+            peak = max(peak, adjusted_equity)
+            drawdown = 0.0 if peak <= 0 else (peak - adjusted_equity) / peak
             points.append(
                 EquityPoint(
                     data_time=point.data_time,
                     cash=point.cash,
                     market_value=point.market_value,
-                    equity=point.equity,
+                    invested_capital=point.invested_capital,
+                    equity=adjusted_equity,
                     drawdown=drawdown,
                 )
             )
@@ -100,6 +109,23 @@ class BacktestTracker:
 
     def _build_daily_returns(self, equity_curve: List[EquityPoint]) -> List[DailyReturnPoint]:
         """把分钟级净值曲线收敛为逐日净值和逐日收益。"""
+        daily_close_equity_series = getattr(self._config, "daily_close_equity_series", None) or {}
+        if daily_close_equity_series:
+            previous_equity = 0.0
+            daily_returns: List[DailyReturnPoint] = []
+            for trade_day in sorted(daily_close_equity_series.keys()):
+                equity = float(daily_close_equity_series[trade_day] or 0.0)
+                daily_return = 0.0 if previous_equity <= 0 else (equity - previous_equity) / previous_equity
+                daily_returns.append(
+                    DailyReturnPoint(
+                        trade_day=f"{trade_day[:4]}-{trade_day[4:6]}-{trade_day[6:8]}",
+                        equity=equity,
+                        daily_return=daily_return,
+                    )
+                )
+                previous_equity = equity
+            return daily_returns
+
         last_point_by_day: dict[str, EquityPoint] = {}
         for point in equity_curve:
             trade_day = point.data_time.strftime("%Y-%m-%d")
@@ -120,12 +146,62 @@ class BacktestTracker:
             previous_equity = point.equity
         return daily_returns
 
-    def _build_metrics(self, equity_curve: List[EquityPoint], daily_returns: List[DailyReturnPoint], trade_stats: Dict[str, object]) -> Dict[str, float]:
+    def _build_benchmark_daily_returns(self, portfolio_daily_returns: List[DailyReturnPoint]) -> List[DailyReturnPoint]:
+        """按投资组合交易日序列对齐基准逐日收益。"""
+        benchmark_series = getattr(self._config, "benchmark_daily_returns", None) or {}
+        if not benchmark_series:
+            return []
+
+        benchmark_base_equity = float(getattr(self._config, "performance_base_equity", 0.0) or 0.0)
+        if benchmark_base_equity <= 0:
+            benchmark_base_equity = float(getattr(self._config, "initial_cash", 0.0) or 0.0)
+
+        normalized_benchmark_series = {
+            str(trade_day).replace("-", ""): float(value)
+            for trade_day, value in benchmark_series.items()
+            if value is not None
+        }
+
+        first_benchmark_close = next(
+            (
+                float(normalized_benchmark_series.get(str(item.trade_day).replace("-", ""), 0.0) or 0.0)
+                for item in portfolio_daily_returns
+                if float(normalized_benchmark_series.get(str(item.trade_day).replace("-", ""), 0.0) or 0.0) > 0
+            ),
+            0.0,
+        )
+        benchmark_scale = benchmark_base_equity / first_benchmark_close if benchmark_base_equity > 0 and first_benchmark_close > 0 else 1.0
+
+        aligned: List[DailyReturnPoint] = []
+        previous_raw_close = 0.0
+        previous_equity = 0.0
+        for item in portfolio_daily_returns:
+            normalized_trade_day = str(item.trade_day).replace("-", "")
+            raw_close = float(normalized_benchmark_series.get(normalized_trade_day, previous_raw_close) or previous_raw_close)
+            benchmark_equity = raw_close * benchmark_scale if raw_close > 0 else previous_equity
+            daily_return = 0.0 if previous_equity <= 0 else (benchmark_equity - previous_equity) / previous_equity
+            aligned.append(
+                DailyReturnPoint(
+                    trade_day=item.trade_day,
+                    equity=benchmark_equity,
+                    daily_return=daily_return,
+                )
+            )
+            if raw_close > 0:
+                previous_raw_close = raw_close
+            if benchmark_equity > 0:
+                previous_equity = benchmark_equity
+        return aligned
+
+    def _build_metrics(self, equity_curve: List[EquityPoint], daily_returns: List[DailyReturnPoint], benchmark_daily_returns: List[DailyReturnPoint], trade_stats: Dict[str, object]) -> Dict[str, float]:
         if not equity_curve:
             return {}
 
-        starting_equity = float(self._config.initial_cash)
+        capital_base = max((point.invested_capital for point in equity_curve), default=0.0)
+        configured_base = float(getattr(self._config, "performance_base_equity", 0.0) or 0.0)
+        starting_equity = configured_base if configured_base > 0 else float(self._config.initial_cash)
         ending_equity = equity_curve[-1].equity
+        ending_nav = (ending_equity / starting_equity) if starting_equity > 0 else 0.0
         total_return = 0.0 if starting_equity <= 0 else (ending_equity - starting_equity) / starting_equity
         max_drawdown = max((point.drawdown for point in equity_curve), default=0.0)
         total_fee = sum(float(trade.total_fee or 0.0) for trade in self._trades)
@@ -140,19 +216,61 @@ class BacktestTracker:
         returns = [point.daily_return for point in daily_returns[1:] if point.equity > 0]
         avg_return = sum(returns) / len(returns) if returns else 0.0
         variance = sum((value - avg_return) ** 2 for value in returns) / len(returns) if returns else 0.0
+        annualized_volatility = sqrt(variance) * sqrt(252) if variance > 0 else 0.0
         sharpe = (avg_return / sqrt(variance)) * sqrt(252) if variance > 0 else 0.0
+        downside_returns = [value for value in returns if value < 0]
+        downside_variance = sum(value ** 2 for value in downside_returns) / len(downside_returns) if downside_returns else 0.0
+        sortino = (avg_return / sqrt(downside_variance)) * sqrt(252) if downside_variance > 0 else 0.0
+        calmar = annualized_return / max_drawdown if max_drawdown > 0 else 0.0
+        max_drawdown_duration = float(self._max_drawdown_duration_days(daily_returns))
 
         day_win_count = sum(1 for item in daily_returns[1:] if item.daily_return > 0)
         day_loss_count = sum(1 for item in daily_returns[1:] if item.daily_return < 0)
         best_day_return = max((item.daily_return for item in daily_returns[1:]), default=0.0)
         worst_day_return = min((item.daily_return for item in daily_returns[1:]), default=0.0)
 
+        benchmark_returns = [item.daily_return for item in benchmark_daily_returns[1:] if item.equity > 0]
+        benchmark_total_return = 0.0
+        benchmark_annualized_return = 0.0
+        alpha = None
+        beta = None
+        tracking_error = None
+        information_ratio = None
+        excess_return = None
+        if benchmark_daily_returns:
+            benchmark_start = next((item.equity for item in benchmark_daily_returns if item.equity > 0), 0.0)
+            benchmark_end = benchmark_daily_returns[-1].equity if benchmark_daily_returns else 0.0
+            if benchmark_start > 0 and benchmark_end > 0:
+                benchmark_total_return = (benchmark_end - benchmark_start) / benchmark_start
+                benchmark_annualized_return = (1 + benchmark_total_return) ** (365.0 / total_days) - 1 if total_days > 0 else 0.0
+                excess_return = total_return - benchmark_total_return
+
+            aligned_portfolio_returns, aligned_benchmark_returns = self._align_return_series(daily_returns, benchmark_daily_returns)
+            if aligned_portfolio_returns and aligned_benchmark_returns:
+                benchmark_avg = sum(aligned_benchmark_returns) / len(aligned_benchmark_returns)
+                covariance = sum(
+                    (port - avg_return) * (bench - benchmark_avg)
+                    for port, bench in zip(aligned_portfolio_returns, aligned_benchmark_returns)
+                ) / len(aligned_portfolio_returns)
+                benchmark_variance = sum((bench - benchmark_avg) ** 2 for bench in aligned_benchmark_returns) / len(aligned_benchmark_returns)
+                beta = covariance / benchmark_variance if benchmark_variance > 0 else None
+                alpha = ((avg_return - (beta or 0.0) * benchmark_avg) * 252) if beta is not None else None
+                active_returns = [port - bench for port, bench in zip(aligned_portfolio_returns, aligned_benchmark_returns)]
+                active_avg = sum(active_returns) / len(active_returns)
+                active_variance = sum((value - active_avg) ** 2 for value in active_returns) / len(active_returns)
+                tracking_error = sqrt(active_variance) * sqrt(252) if active_variance > 0 else 0.0
+                information_ratio = (active_avg / sqrt(active_variance)) * sqrt(252) if active_variance > 0 else 0.0
+
         return {
+            "capital_base": capital_base,
             "starting_equity": starting_equity,
             "ending_equity": ending_equity,
+            "ending_nav": ending_nav,
             "total_return": total_return,
             "annualized_return": annualized_return,
+            "annualized_volatility": annualized_volatility,
             "max_drawdown": max_drawdown,
+            "max_drawdown_duration": max_drawdown_duration,
             "trade_count": float(trade_count),
             "order_count": float(order_count),
             "total_fee": total_fee,
@@ -170,8 +288,47 @@ class BacktestTracker:
             "profit_loss_ratio": float(trade_stats["profit_loss_ratio"]),
             "profit_factor": float(trade_stats["profit_factor"]),
             "total_realized_pnl": float(trade_stats["total_realized_pnl"]),
+            "total_trades": float(trade_stats["closed_trade_count"]),
             "sharpe": sharpe,
+            "sortino": sortino,
+            "calmar": calmar,
+            "benchmark_total_return": benchmark_total_return,
+            "benchmark_annualized_return": benchmark_annualized_return,
+            "alpha": alpha,
+            "beta": beta,
+            "tracking_error": tracking_error,
+            "information_ratio": information_ratio,
+            "excess_return": excess_return,
         }
+
+    @staticmethod
+    def _max_drawdown_duration_days(daily_returns: List[DailyReturnPoint]) -> int:
+        """计算最大回撤持续期，单位为交易日天数。"""
+        peak = float("-inf")
+        current_duration = 0
+        max_duration = 0
+        for point in daily_returns:
+            equity = float(point.equity or 0.0)
+            if equity >= peak:
+                peak = equity
+                current_duration = 0
+                continue
+            current_duration += 1
+            max_duration = max(max_duration, current_duration)
+        return max_duration
+
+    @staticmethod
+    def _align_return_series(portfolio_daily_returns: List[DailyReturnPoint], benchmark_daily_returns: List[DailyReturnPoint]) -> tuple[list[float], list[float]]:
+        """按交易日对齐组合与基准的逐日收益序列。"""
+        benchmark_map = {item.trade_day: item.daily_return for item in benchmark_daily_returns[1:]}
+        aligned_portfolio: list[float] = []
+        aligned_benchmark: list[float] = []
+        for item in portfolio_daily_returns[1:]:
+            if item.trade_day not in benchmark_map:
+                continue
+            aligned_portfolio.append(item.daily_return)
+            aligned_benchmark.append(float(benchmark_map[item.trade_day]))
+        return aligned_portfolio, aligned_benchmark
 
     def _build_trade_statistics(self) -> Dict[str, object]:
         """按成交配对计算更贴近实盘复盘的收益统计。"""

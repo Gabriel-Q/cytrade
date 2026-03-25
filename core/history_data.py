@@ -197,7 +197,10 @@ class HistoryDataManager:
     @classmethod
     def stock_code_to_xt(cls, code: str) -> str:
         """把 6 位证券代码转换为 xtquant 使用的市场后缀格式。"""
-        code = str(code).strip().zfill(6)
+        code = str(code).strip().upper()
+        if ".SH" in code or ".SZ" in code:
+            return code
+        code = code.zfill(6)
         if code.startswith(cls._SH_PREFIXES):
             return f"{code}.SH"
         return f"{code}.SZ"

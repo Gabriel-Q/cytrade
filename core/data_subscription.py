@@ -7,6 +7,7 @@
 """
 import threading
 import time
+import sys
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
@@ -47,6 +48,9 @@ class DataSubscriptionManager:
         self._whole_market_subscribe_id: Optional[int] = None
         self._lock = threading.Lock()
         self._last_recv_time: Optional[datetime] = None
+        self._latest_data_time: Optional[datetime] = None
+        self._latest_latency_ms: float = 0.0
+        self._xtdata_connected = False
 
     # ------------------------------------------------------------------ Public
 
@@ -63,6 +67,7 @@ class DataSubscriptionManager:
             logger.warning("DataSubscription: xtquant 未安装，跳过实际订阅")
             return
         try:
+            self._ensure_xtdata_connected()
             # 逐只订阅（xtdata.subscribe_quote 接收单个代码）
             for code, xt_code in zip(stock_codes, xt_codes):
                 old_sub_id = self._subscription_ids.get(code)
@@ -111,6 +116,7 @@ class DataSubscriptionManager:
             logger.warning("DataSubscription: xtquant 未安装，跳过全市场订阅")
             return
         try:
+            self._ensure_xtdata_connected()
             self._whole_market_subscribe_id = xtdata.subscribe_whole_quote(["SH", "SZ"], callback=self._on_data)
             logger.info("DataSubscription: 全市场订阅已启动 [%s]", period)
         except Exception as e:
@@ -124,6 +130,19 @@ class DataSubscriptionManager:
     def set_data_callback(self, callback: Callable[[Dict[str, TickData]], None]) -> None:
         """设置数据分发回调 — 由 StrategyRunner 注册"""
         self._data_callback = callback
+
+    def get_latest_data_status(self) -> dict:
+        """返回最近一笔行情的时间与延迟快照。"""
+        with self._lock:
+            latest_data_time = self._latest_data_time
+            latest_latency_ms = self._latest_latency_ms
+            last_recv_time = self._last_recv_time
+
+        return {
+            "latest_data_time": latest_data_time,
+            "data_delay_ms": float(latest_latency_ms or 0.0),
+            "last_recv_time": last_recv_time,
+        }
 
     def resubscribe_all(self) -> None:
         """重连后重建全量订阅。
@@ -160,6 +179,7 @@ class DataSubscriptionManager:
         logger.info("DataSubscription: 启动 xtdata.run()")
         if _XT_AVAILABLE:
             try:
+                self._ensure_xtdata_connected()
                 xtdata.run()
             except Exception as e:
                 logger.error("DataSubscription: xtdata.run() 异常: %s", e, exc_info=True)
@@ -179,13 +199,15 @@ class DataSubscriptionManager:
         """处理 xtquant 推送：解析、告警、再转发给策略层。"""
         try:
             recv_time = datetime.now()
-            self._last_recv_time = recv_time
             ticks: Dict[str, TickData] = {}
+            latest_tick: Optional[TickData] = None
 
             for xt_code, data in raw_data.items():
                 code = xt_code.split(".")[0] if "." in xt_code else xt_code
                 tick = self._parse_tick(code, data, recv_time)
                 ticks[code] = tick
+                if latest_tick is None or (tick.data_time or recv_time) >= (latest_tick.data_time or recv_time):
+                    latest_tick = tick
 
                 # 延迟告警
                 if tick.latency_ms > self._latency_threshold * 1000:
@@ -193,6 +215,9 @@ class DataSubscriptionManager:
                         "DataSubscription: 数据延迟 %.1fs > %.1fs [%s]",
                         tick.latency_ms / 1000, self._latency_threshold, code
                     )
+
+            if latest_tick is not None:
+                self._update_latest_data_status(latest_tick)
 
             if ticks and self._data_callback:
                 # 只把已经标准化过的数据对象传给上层，降低策略层复杂度。
@@ -225,10 +250,51 @@ class DataSubscriptionManager:
             recv_time=recv_time,
             latency_ms=0.0,
         )
+        self._update_latest_data_status(tick)
         if self._data_callback:
             self._data_callback({code: tick})
 
     # ------------------------------------------------------------------ Private
+
+    def _ensure_xtdata_connected(self):
+        """确保 xtdata 已与当前 QMT 数据目录建立连接。"""
+        if not _XT_AVAILABLE or self._xtdata_connected:
+            return None
+
+        with self._lock:
+            if self._xtdata_connected:
+                return None
+
+            client = xtdata.connect()
+            self._xtdata_connected = True
+            logger.info("DataSubscription: xtdata 已连接 data_dir=%s", xtdata.get_data_dir())
+            return client
+
+    def _update_latest_data_status(self, tick: TickData) -> None:
+        """更新最近一笔行情快照，并在交互终端中单行刷新显示。"""
+        latest_data_time = tick.data_time or tick.recv_time or datetime.now()
+        last_recv_time = tick.recv_time or datetime.now()
+        with self._lock:
+            self._last_recv_time = last_recv_time
+            self._latest_data_time = latest_data_time
+            self._latest_latency_ms = float(tick.latency_ms or 0.0)
+
+        self._print_latest_data_status(latest_data_time, self._latest_latency_ms)
+
+    @staticmethod
+    def _print_latest_data_status(latest_data_time: datetime, latency_ms: float) -> None:
+        """在本地交互终端中刷新显示最新行情时间与延迟。"""
+        if not getattr(sys.stdout, "isatty", lambda: False)():
+            return
+
+        latest_text = latest_data_time.strftime("%Y-%m-%d %H:%M:%S")
+        if latency_ms >= 1000:
+            delay_text = f"{latency_ms / 1000:.2f}s"
+        else:
+            delay_text = f"{latency_ms:.0f}ms"
+
+        sys.stdout.write(f"\r最新数据时间: {latest_text} | 数据延迟: {delay_text}      ")
+        sys.stdout.flush()
 
     @staticmethod
     def _normalize_period(period: SubscriptionPeriod | str) -> str:

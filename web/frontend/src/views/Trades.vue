@@ -1,8 +1,14 @@
 <template>
   <div>
     <h2>成交记录</h2>
-    <el-table :data="trades" stripe height="600">
-      <el-table-column prop="stock_code" label="标的" width="90" />
+    <el-table :data="sortedTrades" stripe height="600">
+      <el-table-column type="index" label="序号" width="70" />
+      <el-table-column label="标的" min-width="150">
+        <template #default="{ row }">
+          <div>{{ row.stock_code }}</div>
+          <div style="color: var(--el-text-color-secondary); font-size: 12px;">{{ row.stock_name || '-' }}</div>
+        </template>
+      </el-table-column>
       <el-table-column label="回转" width="70">
         <template #default="scope">{{ scope.row.is_t0 ? 'T+0' : 'T+1' }}</template>
       </el-table-column>
@@ -26,12 +32,16 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { computed, ref, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
 import { useSystemStore } from '../stores/system'
+import { formatDateTime, sortByTimeDesc } from '../utils/table'
 
 const store = useSystemStore()
 const trades = ref([])
+const sortedTrades = computed(() =>
+  sortByTimeDesc(trades.value, row => row.trade_time, row => row.traded_time)
+)
 let timer = null
 
 async function load() {
@@ -55,30 +65,7 @@ const fmt2 = (_, __, v) => typeof v === 'number' ? v.toFixed(2) : v
 const fmt3 = (_, __, v) => typeof v === 'number' ? v.toFixed(3) : v
 
 function normalizeTradeTime(row) {
-  const text = row?.trade_time
-  if (typeof text === 'string' && text.trim()) {
-    return text.replace('T', ' ').slice(0, 19)
-  }
-
-  const raw = row?.traded_time
-  if (!raw) return '-'
-
-  const digits = String(raw).replace(/\D/g, '')
-  if (digits.length === 10 || digits.length === 13) {
-    const ts = Number(digits.length === 13 ? digits.slice(0, 13) : digits)
-    const date = new Date(digits.length === 13 ? ts : ts * 1000)
-    if (!Number.isNaN(date.getTime())) {
-      const pad = (value) => String(value).padStart(2, '0')
-      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
-    }
-  }
-  if (digits.length >= 14) {
-    return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)} ${digits.slice(8, 10)}:${digits.slice(10, 12)}:${digits.slice(12, 14)}`
-  }
-  if (digits.length >= 8) {
-    return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`
-  }
-  return String(raw)
+  return formatDateTime(row?.trade_time || row?.traded_time)
 }
 
 onMounted(() => {
