@@ -75,9 +75,41 @@
       </el-col>
     </el-row>
 
+    <el-row :gutter="16" style="margin-top: 16px;">
+      <el-col :span="8">
+        <el-card>
+          <div class="metric">
+            <div class="label">理论可卖总量</div>
+            <div class="number">{{ fmt0(positionSummary.total_sellable_base_quantity) }}</div>
+          </div>
+        </el-card>
+      </el-col>
+      <el-col :span="8">
+        <el-card>
+          <div class="metric">
+            <div class="label">当前可卖总量</div>
+            <div class="number">{{ fmt0(positionSummary.total_available_quantity) }}</div>
+          </div>
+        </el-card>
+      </el-col>
+      <el-col :span="8">
+        <el-card>
+          <div class="metric">
+            <div class="label">冻结差值总量</div>
+            <div class="number">{{ fmt0(positionSummary.total_frozen_quantity) }}</div>
+          </div>
+        </el-card>
+      </el-col>
+    </el-row>
+
     <el-card style="margin-top: 16px;">
       <template #header>
-        <span>费用统计</span>
+        <div class="section-header">
+          <span>费用统计</span>
+          <el-button :loading="syncing" type="primary" plain @click="handleManualSync">
+            立即同步委托/成交
+          </el-button>
+        </div>
       </template>
       <el-row :gutter="16">
         <el-col :span="6">
@@ -139,13 +171,15 @@
 </template>
 
 <script setup>
-import { onMounted, onUnmounted } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
+import { ElMessage } from 'element-plus'
 import { storeToRefs } from 'pinia'
 import { useSystemStore } from '../stores/system'
 
 const store = useSystemStore()
 const { status, positionSummary, capacitySummary } = storeToRefs(store)
 let timer = null
+const syncing = ref(false)
 
 function refresh() {
   // 首页展示的是摘要数据，因此同时刷新系统状态和持仓汇总。
@@ -154,9 +188,31 @@ function refresh() {
   store.fetchCapacitySummary()
 }
 
+async function handleManualSync() {
+  if (syncing.value) return
+  syncing.value = true
+  try {
+    const result = await store.syncOrdersAndTrades()
+    if (result?.success) {
+      ElMessage.success(result.message || '主动同步完成')
+      refresh()
+      return
+    }
+    ElMessage.error(result?.message || '主动同步失败')
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.detail || error?.message || '主动同步失败')
+  } finally {
+    syncing.value = false
+  }
+}
+
 function fmt2(value) {
   // 统一把金额和盈亏格式化成两位小数，避免模板里写重复逻辑。
   return typeof value === 'number' ? value.toFixed(2) : value
+}
+
+function fmt0(value) {
+  return typeof value === 'number' ? value.toFixed(0) : value
 }
 
 function pnlStyle(value) {
@@ -199,4 +255,5 @@ onUnmounted(() => {
 .capacity-chip-name { margin-top: 4px; font-size: 12px; color: #7c5a10; }
 .capacity-empty { margin-top: 16px; color: #6b7280; font-size: 13px; }
 .capacity-empty-inline { color: #9ca3af; font-size: 13px; }
+.section-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 </style>

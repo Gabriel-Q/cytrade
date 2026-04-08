@@ -14,11 +14,19 @@
         <template #default="scope">{{ scope.row.is_t0 ? 'T+0' : 'T+1' }}</template>
       </el-table-column>
       <el-table-column prop="total_quantity" label="持仓量" />
+      <el-table-column prop="sellable_base_quantity" label="理论可卖" />
       <el-table-column prop="available_quantity" label="可用量" />
+      <el-table-column label="冻结差值">
+        <template #default="{ row }">{{ frozenGap(row) }}</template>
+      </el-table-column>
       <el-table-column prop="avg_cost" label="均价" :formatter="fmt3" />
       <el-table-column prop="current_price" label="现价" :formatter="fmt3" />
       <el-table-column prop="market_value" label="市值" :formatter="fmt0" />
-      <el-table-column prop="unrealized_pnl" label="浮动盈亏" :formatter="fmt2" />
+      <el-table-column label="浮动盈亏">
+        <template #default="{ row }">
+          <span :style="pnlStyle(row.unrealized_pnl)">{{ fmt2(null, null, row.unrealized_pnl) }}</span>
+        </template>
+      </el-table-column>
       <el-table-column prop="realized_pnl" label="已实现盈亏" :formatter="fmt2" />
       <el-table-column prop="total_buy_commission" label="买佣" :formatter="fmt2" />
       <el-table-column prop="total_sell_commission" label="卖佣" :formatter="fmt2" />
@@ -34,11 +42,17 @@
 <script setup>
 import { computed, ref, onMounted } from 'vue'
 import axios from 'axios'
-import { formatDateTime, sortByTimeDesc } from '../utils/table'
+import { formatDateTime } from '../utils/table'
 
 const positions = ref([])
 const sortedPositions = computed(() =>
-  sortByTimeDesc(positions.value, row => row.update_time)
+  [...positions.value].sort((left, right) => {
+    const codeCompare = String(left?.stock_code || '').localeCompare(String(right?.stock_code || ''))
+    if (codeCompare !== 0) {
+      return codeCompare
+    }
+    return String(left?.strategy_name || '').localeCompare(String(right?.strategy_name || ''))
+  })
 )
 
 async function load() {
@@ -50,6 +64,17 @@ async function load() {
 const fmt3 = (_, __, v) => typeof v === 'number' ? v.toFixed(3) : v
 const fmt2 = (_, __, v) => typeof v === 'number' ? v.toFixed(2) : v
 const fmt0 = (_, __, v) => typeof v === 'number' ? v.toFixed(0) : v
+const pnlStyle = value => {
+  if (typeof value !== 'number') return {}
+  if (value > 0) return { color: '#f56c6c' }
+  if (value < 0) return { color: '#67c23a' }
+  return {}
+}
+const frozenGap = row => {
+  const sellableBase = Number(row?.sellable_base_quantity || 0)
+  const available = Number(row?.available_quantity || 0)
+  return Math.max(sellableBase - available, 0)
+}
 onMounted(() => {
   load(); setInterval(load, 3000)
 })

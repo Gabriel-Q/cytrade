@@ -326,6 +326,10 @@ def _format_order_info_from_row(row: dict) -> OrderInfo:
     direction = str(row.get("direction", "") or "")
     order_type = str(row.get("order_type", "") or "")
     stock_code = str(row.get("stock_code", "") or "")
+    submitted_at = str(row.get("create_time", "") or "")
+    reported_price = float(row.get("price", 0.0) or 0.0)
+    submitted_price = 0.0 if order_type == "MARKET" else reported_price
+    display_price_text = "最新价" if order_type == "MARKET" else f"{submitted_price:.3f}"
     return OrderInfo(
         order_uuid=str(row.get("order_uuid", "") or ""),
         xt_order_id=int(row.get("xt_order_id", 0) or 0),
@@ -345,7 +349,10 @@ def _format_order_info_from_row(row: dict) -> OrderInfo:
         order_type_text=order_type_text(order_type),
         xt_order_type=int(row.get("xt_order_type", 0) or 0),
         price_type=int(row.get("price_type", 0) or 0),
-        price=float(row.get("price", 0.0) or 0.0),
+        price=reported_price,
+        submitted_price=submitted_price,
+        reported_price=reported_price,
+        display_price_text=display_price_text,
         quantity=int(row.get("quantity", 0) or 0),
         status=str(row.get("status", "") or ""),
         status_text=order_status_text(str(row.get("status", "") or "")),
@@ -368,9 +375,103 @@ def _format_order_info_from_row(row: dict) -> OrderInfo:
         total_fee=float(row.get("total_fee", row.get("commission", 0.0)) or 0.0),
         remark=str(row.get("remark", "") or ""),
         xt_fields={},
-        create_time=str(row.get("create_time", "") or ""),
+        submitted_at=submitted_at,
+        create_time=submitted_at,
         update_time=str(row.get("update_time", "") or ""),
     )
+
+
+def _format_order_info_from_object(order) -> OrderInfo:
+    """把内存中的订单对象转换为 API 响应对象。"""
+    stock_name = _resolve_stock_name(order.stock_code, getattr(order, "instrument_name", ""))
+    order_type = order.order_type.value
+    submitted_at = order.create_time.isoformat()
+    reported_price = float(getattr(order, "price", 0.0) or 0.0)
+    submitted_price = 0.0 if order_type == "MARKET" else reported_price
+    display_price_text = "最新价" if order_type == "MARKET" else f"{submitted_price:.3f}"
+    return OrderInfo(
+        order_uuid=order.order_uuid,
+        xt_order_id=order.xt_order_id,
+        account_type=getattr(order, "account_type", 0),
+        account_id=getattr(order, "account_id", ""),
+        strategy_id=order.strategy_id,
+        strategy_name=_format_strategy_name(order.strategy_name, order.strategy_id),
+        stock_code=order.stock_code,
+        stock_name=stock_name,
+        xt_stock_code=getattr(order, "xt_stock_code", ""),
+        direction=order.direction.value,
+        direction_text=order_direction_text(order.direction.value),
+        order_type=order_type,
+        order_type_text=order_type_text(order_type),
+        xt_order_type=getattr(order, "xt_order_type", 0),
+        price_type=getattr(order, "price_type", 0),
+        price=reported_price,
+        submitted_price=submitted_price,
+        reported_price=reported_price,
+        display_price_text=display_price_text,
+        quantity=order.quantity,
+        status=order.status.value,
+        status_text=order_status_text(order.status.value),
+        cancellable=bool(order.is_active()),
+        xt_order_status=getattr(order, "xt_order_status", 0),
+        status_msg=getattr(order, "status_msg", ""),
+        order_sysid=getattr(order, "order_sysid", ""),
+        order_time=getattr(order, "order_time", 0),
+        xt_direction=getattr(order, "xt_direction", 0),
+        offset_flag=getattr(order, "offset_flag", 0),
+        secu_account=getattr(order, "secu_account", ""),
+        instrument_name=getattr(order, "instrument_name", ""),
+        filled_quantity=order.filled_quantity,
+        filled_avg_price=order.filled_avg_price,
+        filled_amount=order.filled_amount,
+        commission=order.commission,
+        buy_commission=getattr(order, "buy_commission", 0.0),
+        sell_commission=getattr(order, "sell_commission", 0.0),
+        stamp_tax=getattr(order, "stamp_tax", 0.0),
+        total_fee=getattr(order, "total_fee", order.commission),
+        remark=order.remark,
+        xt_fields=dict(getattr(order, "xt_fields", {}) or {}),
+        submitted_at=submitted_at,
+        create_time=submitted_at,
+        update_time=order.update_time.isoformat(),
+    )
+
+
+def _format_sync_action_message(summary: dict) -> str:
+    """把主动同步结果整理成前端可直接展示的消息。"""
+    return (
+        "主动同步完成："
+        f"补录成交 {int(summary.get('trades_synced', 0) or 0)} 笔，"
+        f"修正委托 {int(summary.get('orders_synced', 0) or 0)} 笔，"
+        f"恢复终态 {int(summary.get('state_recovered', 0) or 0)} 笔"
+    )
+
+
+def _load_orders_for_api(strategy_id: Optional[str] = None) -> list[OrderInfo]:
+    """合并数据库历史订单与内存最新状态。"""
+    merged: dict[str, OrderInfo] = {}
+    ordered_ids: list[str] = []
+
+    if _data_manager:
+        for row in _data_manager.query_orders(strategy_id=strategy_id) or []:
+            item = _format_order_info_from_row(row)
+            merged[item.order_uuid] = item
+            ordered_ids.append(item.order_uuid)
+
+    memory_orders = []
+    if _order_manager:
+        memory_orders = (
+            _order_manager.get_orders_by_strategy(strategy_id)
+            if strategy_id else list(_order_manager._orders.values())
+        )
+
+    for order in memory_orders:
+        item = _format_order_info_from_object(order)
+        if item.order_uuid not in merged:
+            ordered_ids.append(item.order_uuid)
+        merged[item.order_uuid] = item
+
+    return [merged[order_uuid] for order_uuid in ordered_ids if order_uuid in merged]
 
 
 def _position_detail_from_position(position: PositionInfo) -> PositionDetail:
@@ -381,6 +482,7 @@ def _position_detail_from_position(position: PositionInfo) -> PositionDetail:
         stock_code=position.stock_code,
         stock_name=_resolve_stock_name(position.stock_code),
         total_quantity=position.total_quantity,
+        sellable_base_quantity=_effective_sellable_base_quantity(position),
         available_quantity=position.available_quantity,
         is_t0=position.is_t0,
         avg_cost=position.avg_cost,
@@ -400,11 +502,12 @@ def _position_detail_from_position(position: PositionInfo) -> PositionDetail:
 
 def _position_from_row(row: dict) -> PositionInfo:
     """把 SQLite 中的持仓快照转换为内存持仓对象。"""
-    return PositionInfo(
+    position = PositionInfo(
         strategy_id=str(row.get("strategy_id", "") or ""),
         strategy_name=str(row.get("strategy_name", "") or ""),
         stock_code=str(row.get("stock_code", "") or ""),
         total_quantity=int(row.get("total_quantity", 0) or 0),
+        sellable_base_quantity=int(row.get("sellable_base_quantity", row.get("available_quantity", 0)) or 0),
         available_quantity=int(row.get("available_quantity", 0) or 0),
         is_t0=bool(row.get("is_t0", 0)),
         avg_cost=float(row.get("avg_cost", 0.0) or 0.0),
@@ -421,6 +524,17 @@ def _position_from_row(row: dict) -> PositionInfo:
         total_fees=float(row.get("total_fees", 0.0) or 0.0),
         update_time=datetime.fromisoformat(str(row.get("update_time", "") or datetime.now().isoformat()).replace(" ", "T")),
     )
+    return PositionManager.normalize_restored_position(position)
+
+
+def _effective_sellable_base_quantity(position: PositionInfo | None) -> int:
+    """兼容老对象，推导接口层应展示的理论可卖基线。"""
+    if not position:
+        return 0
+    total_quantity = max(0, int(getattr(position, "total_quantity", 0) or 0))
+    available_quantity = max(0, int(getattr(position, "available_quantity", 0) or 0))
+    explicit_sellable_base = max(0, int(getattr(position, "sellable_base_quantity", 0) or 0))
+    return min(total_quantity, max(explicit_sellable_base, available_quantity))
 
 
 def _collect_live_positions() -> list[PositionInfo]:
@@ -447,6 +561,20 @@ def _is_managed_trade_row(row: dict) -> bool:
     return bool(str(row.get("strategy_id", "") or "").strip())
 
 
+def _dedupe_trade_rows(rows: list[dict]) -> list[dict]:
+    """按 trade_id 去重成交记录，避免重复成交污染展示和持仓回放。"""
+    deduped: list[dict] = []
+    seen_trade_ids: set[str] = set()
+    for row in rows or []:
+        trade_id = str(row.get("trade_id", "") or row.get("traded_id", "") or "").strip()
+        if trade_id:
+            if trade_id in seen_trade_ids:
+                continue
+            seen_trade_ids.add(trade_id)
+        deduped.append(row)
+    return deduped
+
+
 def _trade_day_from_row(row: dict) -> str:
     """提取成交所属交易日，统一成 YYYYMMDD。"""
     for field in ("traded_time", "trade_time"):
@@ -471,10 +599,10 @@ def _get_strategy_trade_rows(strategy_id: str) -> list[dict]:
     """读取某个策略的全部受管成交，并按时间顺序排序。"""
     if not _data_manager:
         return []
-    rows = [
+    rows = _dedupe_trade_rows([
         row for row in (_data_manager.query_trades(strategy_id=strategy_id) or [])
         if _is_managed_trade_row(row)
-    ]
+    ])
     return sorted(
         rows,
         key=lambda row: (
@@ -543,6 +671,7 @@ def _replay_strategy_position_from_trades(strategy_id: str) -> StrategyPositionR
             amount=trade.amount,
             order_remark=trade.order_remark,
             total_quantity=int(getattr(position, "total_quantity", 0) or 0),
+            sellable_base_quantity=_effective_sellable_base_quantity(position),
             available_quantity=int(getattr(position, "available_quantity", 0) or 0),
             avg_cost=float(getattr(position, "avg_cost", 0.0) or 0.0),
             realized_pnl=float(getattr(position, "realized_pnl", 0.0) or 0.0),
@@ -550,6 +679,8 @@ def _replay_strategy_position_from_trades(strategy_id: str) -> StrategyPositionR
         ))
 
     final_position = temp_mgr.get_position(strategy_id)
+    if final_position and current_day:
+        PositionManager.normalize_restored_position(final_position, source_trade_day=current_day)
     live_position = _get_position_for_strategy(strategy_id)
     stock_code = ""
     strategy_name = ""
@@ -567,8 +698,10 @@ def _replay_strategy_position_from_trades(strategy_id: str) -> StrategyPositionR
         stock_name=_resolve_stock_name(stock_code),
         step_count=len(steps),
         final_total_quantity=int(getattr(final_position, "total_quantity", 0) or 0),
+        final_sellable_base_quantity=_effective_sellable_base_quantity(final_position),
         final_available_quantity=int(getattr(final_position, "available_quantity", 0) or 0),
         live_total_quantity=int(getattr(live_position, "total_quantity", 0) or 0),
+        live_sellable_base_quantity=_effective_sellable_base_quantity(live_position),
         live_available_quantity=int(getattr(live_position, "available_quantity", 0) or 0),
         steps=steps,
     )
@@ -578,7 +711,7 @@ def _rebuild_positions_from_trades() -> list[PositionInfo]:
     """当快照持仓缺失时，用成交记录回放重建当前持仓视图。"""
     if not _data_manager:
         return []
-    rows = _data_manager.query_trades()
+    rows = _dedupe_trade_rows(_data_manager.query_trades())
     if not rows:
         return []
 
@@ -682,6 +815,8 @@ def _summarize_positions(positions: list[PositionInfo]) -> dict:
     total_buy_commission = sum(pos.total_buy_commission for pos in positions)
     total_sell_commission = sum(pos.total_sell_commission for pos in positions)
     total_stamp_tax = sum(pos.total_stamp_tax for pos in positions)
+    total_sellable_base_quantity = sum(_effective_sellable_base_quantity(pos) for pos in positions)
+    total_available_quantity = sum(max(0, int(getattr(pos, "available_quantity", 0) or 0)) for pos in positions)
     return {
         "positions_count": len(positions),
         "total_market_value": total_market,
@@ -693,6 +828,9 @@ def _summarize_positions(positions: list[PositionInfo]) -> dict:
         "total_sell_commission": total_sell_commission,
         "total_stamp_tax": total_stamp_tax,
         "total_fees": total_commission,
+        "total_sellable_base_quantity": total_sellable_base_quantity,
+        "total_available_quantity": total_available_quantity,
+        "total_frozen_quantity": max(total_sellable_base_quantity - total_available_quantity, 0),
         "total_pnl": total_unrealized + total_realized,
     }
 
@@ -746,6 +884,7 @@ if _FASTAPI and router is not None:
                 stock_name=_resolve_stock_name(str(item.get("stock_code", "") or "")),
                 pause_reason=str(item.get("pause_reason", "") or ""),
                 strategy_total_quantity=int(item.get("strategy_total_quantity", 0) or 0),
+                strategy_sellable_base_quantity=int(item.get("strategy_sellable_base_quantity", item.get("strategy_available_quantity", 0)) or 0),
                 strategy_available_quantity=int(item.get("strategy_available_quantity", 0) or 0),
                 account_total_quantity=int(item.get("account_total_quantity", 0) or 0),
                 account_available_quantity=int(item.get("account_available_quantity", 0) or 0),
@@ -818,6 +957,20 @@ if _FASTAPI and router is not None:
         s.close_position(remark="Web 强制平仓")
         return ActionResponse(success=True, message=f"策略 {strategy_id[:8]} 平仓指令已发送")
 
+    @router.post("/strategies/{strategy_id}/cancel-entry-and-release", response_model=ActionResponse, tags=["策略"])
+    async def cancel_strategy_entry_and_release(strategy_id: str):
+        """撤销未成交建仓单，并在安全时释放名额。"""
+        if not _strategy_runner:
+            raise HTTPException(status_code=503, detail="StrategyRunner 未初始化")
+        result = _strategy_runner.cancel_entry_orders_and_recover(
+            strategy_id,
+            remark="Web 手动撤销建仓单并释放名额",
+        )
+        return ActionResponse(
+            success=bool(result.get("success", False)),
+            message=str(result.get("message", "")),
+        )
+
     # ------------------------------------------------------------------ 持仓
 
     @router.get("/positions", response_model=List[PositionDetail], tags=["持仓"])
@@ -845,64 +998,7 @@ if _FASTAPI and router is not None:
         """获取订单列表，可按策略过滤。"""
         if not _order_manager and not _data_manager:
             return []
-        # 这里优先复用内存中的订单对象，
-        # 因为它比数据库更能体现“当前最新状态”。
-        orders = []
-        if _order_manager:
-            orders = (_order_manager.get_orders_by_strategy(strategy_id)
-                      if strategy_id else list(_order_manager._orders.values()))
-        result = []
-        for o in orders:
-            stock_name = _resolve_stock_name(o.stock_code, getattr(o, "instrument_name", ""))
-            result.append(OrderInfo(
-                order_uuid=o.order_uuid,
-                xt_order_id=o.xt_order_id,
-                account_type=getattr(o, "account_type", 0),
-                account_id=getattr(o, "account_id", ""),
-                strategy_id=o.strategy_id,
-                strategy_name=_format_strategy_name(o.strategy_name, o.strategy_id),
-                stock_code=o.stock_code,
-                stock_name=stock_name,
-                xt_stock_code=getattr(o, "xt_stock_code", ""),
-                direction=o.direction.value,
-                direction_text=order_direction_text(o.direction.value),
-                order_type=o.order_type.value,
-                order_type_text=order_type_text(o.order_type.value),
-                xt_order_type=getattr(o, "xt_order_type", 0),
-                price_type=getattr(o, "price_type", 0),
-                price=o.price,
-                quantity=o.quantity,
-                status=o.status.value,
-                status_text=order_status_text(o.status.value),
-                cancellable=bool(o.is_active()),
-                xt_order_status=getattr(o, "xt_order_status", 0),
-                status_msg=getattr(o, "status_msg", ""),
-                order_sysid=getattr(o, "order_sysid", ""),
-                order_time=getattr(o, "order_time", 0),
-                xt_direction=getattr(o, "xt_direction", 0),
-                offset_flag=getattr(o, "offset_flag", 0),
-                secu_account=getattr(o, "secu_account", ""),
-                instrument_name=getattr(o, "instrument_name", ""),
-                filled_quantity=o.filled_quantity,
-                filled_avg_price=o.filled_avg_price,
-                filled_amount=o.filled_amount,
-                commission=o.commission,
-                buy_commission=getattr(o, "buy_commission", 0.0),
-                sell_commission=getattr(o, "sell_commission", 0.0),
-                stamp_tax=getattr(o, "stamp_tax", 0.0),
-                total_fee=getattr(o, "total_fee", o.commission),
-                remark=o.remark,
-                xt_fields=dict(getattr(o, "xt_fields", {}) or {}),
-                create_time=o.create_time.isoformat(),
-                update_time=o.update_time.isoformat(),
-            ))
-        if result or not _data_manager:
-            return result
-
-        return [
-            _format_order_info_from_row(row)
-            for row in _data_manager.query_orders(strategy_id=strategy_id)
-        ]
+        return _load_orders_for_api(strategy_id=strategy_id)
 
     @router.get("/orders/{order_uuid}", response_model=OrderInfo, tags=["订单"])
     async def get_order(order_uuid: str):
@@ -911,48 +1007,7 @@ if _FASTAPI and router is not None:
             raise HTTPException(status_code=503, detail="OrderManager 未初始化")
         o = _order_manager.get_order(order_uuid) if _order_manager else None
         if o:
-            return OrderInfo(
-                order_uuid=o.order_uuid,
-                xt_order_id=o.xt_order_id,
-                account_type=getattr(o, "account_type", 0),
-                account_id=getattr(o, "account_id", ""),
-                strategy_id=o.strategy_id,
-                strategy_name=_format_strategy_name(o.strategy_name, o.strategy_id),
-                stock_code=o.stock_code,
-                stock_name=_resolve_stock_name(o.stock_code, getattr(o, "instrument_name", "")),
-                xt_stock_code=getattr(o, "xt_stock_code", ""),
-                direction=o.direction.value,
-                direction_text=order_direction_text(o.direction.value),
-                order_type=o.order_type.value,
-                order_type_text=order_type_text(o.order_type.value),
-                xt_order_type=getattr(o, "xt_order_type", 0),
-                price_type=getattr(o, "price_type", 0),
-                price=o.price,
-                quantity=o.quantity,
-                status=o.status.value,
-                status_text=order_status_text(o.status.value),
-                cancellable=bool(o.is_active()),
-                xt_order_status=getattr(o, "xt_order_status", 0),
-                status_msg=getattr(o, "status_msg", ""),
-                order_sysid=getattr(o, "order_sysid", ""),
-                order_time=getattr(o, "order_time", 0),
-                xt_direction=getattr(o, "xt_direction", 0),
-                offset_flag=getattr(o, "offset_flag", 0),
-                secu_account=getattr(o, "secu_account", ""),
-                instrument_name=getattr(o, "instrument_name", ""),
-                filled_quantity=o.filled_quantity,
-                filled_avg_price=o.filled_avg_price,
-                filled_amount=o.filled_amount,
-                commission=o.commission,
-                buy_commission=getattr(o, "buy_commission", 0.0),
-                sell_commission=getattr(o, "sell_commission", 0.0),
-                stamp_tax=getattr(o, "stamp_tax", 0.0),
-                total_fee=getattr(o, "total_fee", o.commission),
-                remark=o.remark,
-                xt_fields=dict(getattr(o, "xt_fields", {}) or {}),
-                create_time=o.create_time.isoformat(),
-                update_time=o.update_time.isoformat(),
-            )
+            return _format_order_info_from_object(o)
 
         if _data_manager:
             rows = _data_manager.query_orders(order_uuids=[order_uuid])
@@ -990,7 +1045,7 @@ if _FASTAPI and router is not None:
         """获取成交记录列表，支持按策略和日期过滤。"""
         if not _data_manager:
             return []
-        records = _data_manager.query_trades(strategy_id, start_date, end_date)
+        records = _dedupe_trade_rows(_data_manager.query_trades(strategy_id, start_date, end_date))
         result = []
         for t in records:
             if not _is_managed_trade_row(t):
@@ -1014,7 +1069,9 @@ if _FASTAPI and router is not None:
                 order_type=int(t.get("order_type", 0) or 0),
                 traded_time=traded_time,
                 order_sysid=str(t.get("order_sysid", "") or ""),
+                order_trace_id=str(t.get("order_trace_id", "") or ""),
                 order_remark=str(t.get("order_remark", "") or ""),
+                remark=str(t.get("remark", "") or ""),
                 xt_direction=int(t.get("xt_direction", 0) or 0),
                 offset_flag=int(t.get("offset_flag", 0) or 0),
                 direction=direction,
@@ -1074,6 +1131,17 @@ if _FASTAPI and router is not None:
             mem_pct=mem,
             timestamp=datetime.now().isoformat(),
         )
+
+    @router.post("/system/sync-orders-and-trades", response_model=ActionResponse, tags=["系统"])
+    async def sync_orders_and_trades():
+        """主动拉取一次柜台委托/成交并刷新本地状态。"""
+        if not _strategy_runner:
+            raise HTTPException(status_code=503, detail="StrategyRunner 未初始化")
+        if not _connection_manager or not _connection_manager.is_connected():
+            return ActionResponse(success=False, message="交易连接未建立，无法执行主动同步")
+
+        summary = _strategy_runner.sync_orders_and_trades_once(reason="web_manual")
+        return ActionResponse(success=True, message=_format_sync_action_message(summary))
 
     @router.get("/system/logs", tags=["系统"])
     async def get_logs(lines: int = Query(100)):

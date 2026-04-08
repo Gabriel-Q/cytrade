@@ -61,6 +61,9 @@ except ImportError:
         def query_stock_orders(self, account, cancelable_only=False):
             return []
 
+        def query_stock_trades(self, account):
+            return []
+
         def query_account_status(self):
             return []
 
@@ -311,6 +314,19 @@ class ConnectionManager:
             return list(orders or [])
         except Exception as exc:
             logger.error("ConnectionManager: 查询委托异常: %s", exc, exc_info=True)
+            return []
+
+    def query_stock_trades(self) -> list[Any]:
+        """查询当前账户的当日成交列表。"""
+        trader = self.get_trader()
+        if not trader or not self._account:
+            logger.warning("ConnectionManager: 查询成交失败，交易连接尚未就绪")
+            return []
+        try:
+            trades = trader.query_stock_trades(self._account)
+            return list(trades or [])
+        except Exception as exc:
+            logger.error("ConnectionManager: 查询成交异常: %s", exc, exc_info=True)
             return []
 
     def query_account_status(self) -> list[Any]:

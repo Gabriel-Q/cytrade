@@ -61,6 +61,7 @@ class PausedStrategyReconciliation(BaseModel):
     stock_name: str = ""
     pause_reason: str = ""
     strategy_total_quantity: int = 0
+    strategy_sellable_base_quantity: int = 0
     strategy_available_quantity: int = 0
     account_total_quantity: int = 0
     account_available_quantity: int = 0
@@ -73,6 +74,7 @@ class PositionDetail(BaseModel):
     stock_code: str                     # 标的代码。
     stock_name: str = ""               # 标的名称。
     total_quantity: int                 # 总持仓数量。
+    sellable_base_quantity: int         # 理论可卖基线。
     available_quantity: int             # 当前可卖数量。
     is_t0: bool = False                 # 是否按 T+0 规则处理。
     avg_cost: float                     # 平均持仓成本。
@@ -101,6 +103,9 @@ class PositionSummary(BaseModel):
     total_sell_commission: float = 0.0   # 总卖出佣金。
     total_stamp_tax: float = 0.0         # 总印花税。
     total_fees: float = 0.0              # 总费用别名字段。
+    total_sellable_base_quantity: int = 0  # 理论可卖总量。
+    total_available_quantity: int = 0      # 当前可卖总量。
+    total_frozen_quantity: int = 0         # 理论可卖与当前可卖之间的差值总量。
     total_pnl: float                     # 总盈亏。
 
 
@@ -122,6 +127,9 @@ class OrderInfo(BaseModel):
     xt_order_type: int = 0                # Xt 原始订单类型。
     price_type: int = 0                   # Xt 原始报价类型。
     price: float                          # 委托价格。
+    submitted_price: float = 0.0          # 业务语义上的提交价；市价/最新价单固定为 0。
+    reported_price: float = 0.0           # 柜台回报原始价格；排障时使用。
+    display_price_text: str = ""          # 前端直接展示用价格文案。
     quantity: int                         # 委托数量。
     status: str                           # 内部订单状态值。
     status_text: str                      # 展示用订单状态文本。
@@ -144,6 +152,7 @@ class OrderInfo(BaseModel):
     total_fee: float = 0.0                # 总费用明细字段。
     remark: str                           # 备注。
     xt_fields: Dict[str, Any] = {}        # 原始 Xt 字段快照。
+    submitted_at: str = ""               # 本地下单时间，仅表示系统侧提交/注册时间。
     create_time: str                      # 创建时间。
     update_time: str                      # 更新时间。
 
@@ -167,7 +176,9 @@ class TradeInfo(BaseModel):
     order_type: int                       # Xt 原始订单类型。
     traded_time: int                      # Xt 原始成交时间。
     order_sysid: str                      # 柜台合同编号。
+    order_trace_id: str = ""            # 内部 23 位跟踪标识。
     order_remark: str                     # 委托备注。
+    remark: str = ""                    # 业务备注/下单原因。
     xt_direction: int                     # Xt 原始方向值。
     offset_flag: int                      # Xt 原始开平方向值。
 
@@ -197,6 +208,7 @@ class StrategyPositionReplayStep(BaseModel):
     amount: float
     order_remark: str = ""
     total_quantity: int = 0
+    sellable_base_quantity: int = 0
     available_quantity: int = 0
     avg_cost: float = 0.0
     realized_pnl: float = 0.0
@@ -211,8 +223,10 @@ class StrategyPositionReplay(BaseModel):
     stock_name: str = ""
     step_count: int = 0
     final_total_quantity: int = 0
+    final_sellable_base_quantity: int = 0
     final_available_quantity: int = 0
     live_total_quantity: int = 0
+    live_sellable_base_quantity: int = 0
     live_available_quantity: int = 0
     steps: List[StrategyPositionReplayStep] = []
 

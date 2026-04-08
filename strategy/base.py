@@ -692,6 +692,19 @@ class BaseStrategy(ABC):
             # 类级统计和子类扩展钩子都放在订单回报阶段更新，保证与真实成交状态一致。
             self.__class__._sync_class_stats(self._position_mgr)
             self._on_order_update_hook(order)
+            if (
+                order.direction == OrderDirection.BUY
+                and order.status in (
+                    OrderStatus.SUCCEEDED,
+                    OrderStatus.CANCELED,
+                    OrderStatus.PART_CANCEL,
+                    OrderStatus.JUNK,
+                    OrderStatus.UNKNOWN,
+                )
+                and not self._has_position_for_slot()
+                and not self._has_active_entry_order()
+            ):
+                self.recover_unfilled_entry_state()
         except Exception as e:
             logger.error("Strategy[%s] on_order_update 异常: %s",
                          self.strategy_id[:8], e, exc_info=True)
@@ -699,6 +712,10 @@ class BaseStrategy(ABC):
     def _on_order_update_hook(self, order: Order) -> None:
         """子类可覆盖以处理订单状态变更"""
         pass
+
+    def recover_unfilled_entry_state(self) -> None:
+        """在买单终结且无持仓时，把策略收敛回可竞争状态。"""
+        self.reconcile_position_slot_state()
 
     # ------------------------------------------------------------------ 持久化
 

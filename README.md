@@ -1,5 +1,8 @@
 # cytrade
 
+# 重要提示：第一版已实盘测试，开发完毕。第二版会有大更新，将异步编程全部修改为Async/Await范式，摒弃回调函数的方法。增加其他市场接入能力。
+
+
 cytrade 是一个基于 [xtquant](https://dict.thinktrader.net/nativeApi/start_now.html) / QMT 的 Python 量化交易框架，覆盖以下完整链路：
 
 - 交易连接与自动重连

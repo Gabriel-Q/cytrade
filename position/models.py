@@ -31,6 +31,7 @@ class PositionInfo:
     strategy_name: str = ""
     stock_code: str = ""
     total_quantity: int = 0              # 总持仓数量
+    sellable_base_quantity: int = 0      # 理论可卖基线（不含账户临时冻结影响）
     available_quantity: int = 0          # 可用数量（T+1 规则下可能低于 total）
     is_t0: bool = False                  # 是否允许当日回转（T+0）
     avg_cost: float = 0.0               # 移动平均成本价

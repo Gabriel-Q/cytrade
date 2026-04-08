@@ -63,12 +63,24 @@
       </el-table-column>
       <el-table-column prop="total_quantity" label="持仓量" />
       <el-table-column prop="avg_cost" label="均价" :formatter="fmt2" />
-      <el-table-column prop="unrealized_pnl" label="浮动盈亏" :formatter="fmt2" />
-      <el-table-column label="操作" width="320">
+      <el-table-column label="浮动盈亏">
+        <template #default="{ row }">
+          <span :style="pnlStyle(row.unrealized_pnl)">{{ fmt2(null, null, row.unrealized_pnl) }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="操作" width="440">
         <template #default="{ row }">
           <el-button size="small" @click="pause(row)">暂停</el-button>
           <el-button size="small" type="primary" @click="resume(row)">恢复</el-button>
           <el-button size="small" type="danger" @click="close(row)">平仓</el-button>
+          <el-button
+            v-if="showReleaseEntryButton(row)"
+            size="small"
+            type="warning"
+            @click="releaseEntry(row)"
+          >
+            撤挂单释放名额
+          </el-button>
           <el-button
             v-if="showRuntimeStateButton(row)"
             size="small"
@@ -88,7 +100,7 @@ import { computed, ref, onMounted } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { strategyStatusText, strategyStatusTagType } from '../utils/status'
-import { formatDateTime, sortByTimeDesc } from '../utils/table'
+import { formatDateTime, toTimeValue } from '../utils/table'
 
 const strategies = ref([])
 const capacityFilter = ref('all')
@@ -116,9 +128,26 @@ const filteredStrategies = computed(() => {
   return rows
 })
 
-const sortedStrategies = computed(() =>
-  sortByTimeDesc(filteredStrategies.value, row => row.create_time)
-)
+const sortedStrategies = computed(() => {
+  const rows = Array.isArray(filteredStrategies.value) ? filteredStrategies.value.slice() : []
+  return rows.sort((left, right) => {
+    const leftName = String(left?.strategy_name || '').trim()
+    const rightName = String(right?.strategy_name || '').trim()
+    const nameCompare = leftName.localeCompare(rightName, 'zh-CN')
+    if (nameCompare !== 0) {
+      return nameCompare
+    }
+
+    const leftCode = String(left?.stock_code || '').trim()
+    const rightCode = String(right?.stock_code || '').trim()
+    const codeCompare = leftCode.localeCompare(rightCode, 'zh-CN')
+    if (codeCompare !== 0) {
+      return codeCompare
+    }
+
+    return toTimeValue(right?.create_time) - toTimeValue(left?.create_time)
+  })
+})
 
 async function load() {
   // 拉取当前所有策略的最新状态。
@@ -136,6 +165,10 @@ function strategyRowClassName({ row }) {
 
 function showRuntimeStateButton(row) {
   return ['PAUSED', 'ERROR'].includes(String(row?.status || '').toUpperCase())
+}
+
+function showReleaseEntryButton(row) {
+  return Boolean(row?.capacity?.occupying) && Number(row?.total_quantity || 0) <= 0
 }
 
 function runtimeStateButtonType(row) {
@@ -177,8 +210,28 @@ async function clearRuntimeState(row) {
   load()
 }
 
+async function releaseEntry(row) {
+  const stockLabel = row.stock_name ? `${row.stock_code} ${row.stock_name}` : row.stock_code
+  await ElMessageBox.confirm(
+    `确认撤销 ${stockLabel} 当前未成交建仓单，并在安全时释放名额？`,
+    '确认',
+    { type: 'warning' }
+  )
+  const res = await axios.post(`/api/strategies/${row.strategy_id}/cancel-entry-and-release`)
+  ElMessage.success(res?.data?.message || '处理完成')
+  load()
+}
+
 // 页面内统一的数字格式化函数。
 const fmt2 = (_, __, val) => typeof val === 'number' ? val.toFixed(2) : val
+
+function pnlStyle(value) {
+  if (typeof value !== 'number') return {}
+  if (value > 0) return { color: '#f56c6c' }
+  if (value < 0) return { color: '#67c23a' }
+  return {}
+}
+
 const statusText = strategyStatusText
 const tagType = strategyStatusTagType
 

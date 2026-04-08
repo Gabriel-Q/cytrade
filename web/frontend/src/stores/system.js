@@ -20,6 +20,9 @@ export const useSystemStore = defineStore('system', () => {
     total_sell_commission: 0,
     total_stamp_tax: 0,
     total_fees: 0,
+    total_sellable_base_quantity: 0,
+    total_available_quantity: 0,
+    total_frozen_quantity: 0,
     total_pnl: 0,
   })
   const capacitySummary = ref([])
@@ -51,6 +54,11 @@ export const useSystemStore = defineStore('system', () => {
     } catch (e) { console.error(e) }
   }
 
+  async function syncOrdersAndTrades() {
+    const res = await axios.post('/api/system/sync-orders-and-trades')
+    return res.data
+  }
+
   function handleWsMessage(msg) {
     // tick 推送按证券代码覆盖，永远保留“最新一条”。
     if (msg.type === 'tick') {
@@ -75,6 +83,7 @@ export const useSystemStore = defineStore('system', () => {
     fetchStatus,
     fetchPositionSummary,
     fetchCapacitySummary,
+    syncOrdersAndTrades,
     handleWsMessage,
   }
 })

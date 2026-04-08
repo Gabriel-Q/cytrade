@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Type
 
 from config.enums import AlertLevel, OrderDirection, OrderStatus, OrderType, StrategyStatus
 from core.models import TickData
-from core.trading_calendar import is_market_day
+from core.trading_calendar import is_market_day, minus_one_market_day
 from position.manager import PositionManager
 from position.models import FifoLot, PositionInfo
 from strategy.base import BaseStrategy
@@ -108,6 +108,8 @@ class StrategyRunner:
         self._heartbeat_callback = None
         # ``_alert_callback`` 用于发送启动前账户校验告警。
         self._alert_callback = None
+        # ``_known_trade_ids`` 缓存已处理成交，避免主动同步重复回放同一笔成交。
+        self._known_trade_ids: Optional[set[str]] = None
 
     def set_heartbeat_callback(self, callback) -> None:
         """注册心跳回调，供看门狗感知策略主循环是否仍在工作。"""
@@ -137,10 +139,12 @@ class StrategyRunner:
         # 把快照里记录的活动订单 UUID 重新装载回内存，
         # 避免异常重启后策略忘记自己仍有挂单未完结。
         self._restore_pending_orders_from_storage()
+        self._cleanup_orphaned_pending_orders_from_storage()
 
         # 在真正开始盯盘前，先核对账户资产和账户持仓，
         # 防止策略内部状态与真实账户状态明显不一致。
         self._validate_account_constraints()
+        self.sync_orders_and_trades_once(reason="startup")
 
         # 注册数据回调
         if self._data_sub:
@@ -325,6 +329,7 @@ class StrategyRunner:
                 "stock_code": strategy.stock_code,
                 "pause_reason": strategy.get_pause_reason(),
                 "strategy_total_quantity": int(getattr(position, "total_quantity", 0) or 0),
+                "strategy_sellable_base_quantity": int(getattr(position, "sellable_base_quantity", getattr(position, "available_quantity", 0)) or 0),
                 "strategy_available_quantity": int(getattr(position, "available_quantity", 0) or 0),
                 "account_total_quantity": int(account_position.get("volume", 0) or 0),
                 "account_available_quantity": int(account_position.get("can_use_volume", 0) or 0),
@@ -486,10 +491,15 @@ class StrategyRunner:
 
         loaded_trade_day = str(getattr(self._data_mgr, "_last_loaded_state_day", "") or "")
         current_trade_day = datetime.now().strftime("%Y%m%d")
-        if self._position_mgr and loaded_trade_day and loaded_trade_day == current_trade_day:
-            # 同一交易日内重启时，快照中的 available_quantity 已经代表当日真实状态，
-            # 不应在首个 tick 到来时再次执行“新交易日解锁”。
-            self._position_mgr.mark_trade_day_processed(current_trade_day)
+        if not is_market_day(current_trade_day):
+            current_trade_day = minus_one_market_day(current_trade_day)
+        if self._position_mgr and loaded_trade_day:
+            if loaded_trade_day == current_trade_day:
+                # 同一交易日内重启时，快照中的 available_quantity 已经代表当日真实状态，
+                # 不应在首个 tick 到来时再次执行“新交易日解锁”。
+                self._position_mgr.mark_trade_day_processed(current_trade_day)
+            else:
+                self._position_mgr.unlock_available_quantities(current_trade_day)
 
         logger.info("StrategyRunner: 从快照恢复 %d 个策略", len(self._strategies))
         return len(self._strategies) > 0
@@ -531,7 +541,7 @@ class StrategyRunner:
         if not self._position_mgr or not self._data_mgr:
             return
 
-        rows = self._data_mgr.query_trades(strategy_id=strategy.strategy_id)
+        rows = self._dedupe_trade_rows(self._data_mgr.query_trades(strategy_id=strategy.strategy_id))
         if not rows:
             return
 
@@ -552,6 +562,7 @@ class StrategyRunner:
 
     def _rebuild_position_from_trade_rows(self, rows: List[dict]) -> Optional[PositionInfo]:
         """按单策略成交记录回放重建持仓。"""
+        rows = self._dedupe_trade_rows(rows)
         if not rows:
             return None
 
@@ -577,7 +588,24 @@ class StrategyRunner:
                 current_day = trade_day
             temp_mgr.on_trade_callback(self._trade_from_storage_row(row))
 
-        return temp_mgr.get_position(strategy_id)
+        rebuilt = temp_mgr.get_position(strategy_id)
+        if rebuilt and current_day:
+            PositionManager.normalize_restored_position(rebuilt, source_trade_day=current_day)
+        return rebuilt
+
+    @staticmethod
+    def _dedupe_trade_rows(rows: List[dict]) -> List[dict]:
+        """按 trade_id 去重成交记录，避免重复回放同一笔成交。"""
+        deduped: List[dict] = []
+        seen_trade_ids: set[str] = set()
+        for row in rows or []:
+            trade_id = str(row.get("trade_id", "") or row.get("traded_id", "") or "").strip()
+            if trade_id:
+                if trade_id in seen_trade_ids:
+                    continue
+                seen_trade_ids.add(trade_id)
+            deduped.append(row)
+        return deduped
 
     @staticmethod
     def _trade_day_from_row(row: dict) -> str:
@@ -669,6 +697,7 @@ class StrategyRunner:
             strategy_name=str(row.get("strategy_name", "") or ""),
             stock_code=str(row.get("stock_code", "") or ""),
             total_quantity=int(row.get("total_quantity", 0) or 0),
+            sellable_base_quantity=int(row.get("sellable_base_quantity", row.get("available_quantity", 0)) or 0),
             available_quantity=int(row.get("available_quantity", 0) or 0),
             is_t0=bool(row.get("is_t0", 0)),
             avg_cost=float(row.get("avg_cost", 0.0) or 0.0),
@@ -717,6 +746,8 @@ class StrategyRunner:
                 self._scheduler.add_job(self._autosave_state, "interval",
                                         seconds=self._state_autosave_interval_sec,
                                         id="autosave_state")
+            self._scheduler.add_job(self._sync_orders_and_trades_job, "interval",
+                                    seconds=30, id="sync_orders_and_trades")
             # 每30分钟清理已停止策略
             self._scheduler.add_job(self._cleanup_stopped, "interval",
                                     minutes=30, id="cleanup")
@@ -875,11 +906,52 @@ class StrategyRunner:
             logger.info("StrategyRunner: 已从持久化订单恢复 %d 个活动订单", restored_count)
         return restored_count
 
+    def _cleanup_orphaned_pending_orders_from_storage(self) -> int:
+        """清理数据库里未被任何活策略接管的本地待报挂单。"""
+        if not self._data_mgr:
+            return 0
+
+        active_statuses = {
+            OrderStatus.UNREPORTED.value,
+            OrderStatus.WAIT_REPORTING.value,
+            OrderStatus.REPORTED.value,
+            OrderStatus.REPORTED_CANCEL.value,
+            OrderStatus.PARTSUCC_CANCEL.value,
+            OrderStatus.PART_SUCC.value,
+        }
+        with self._lock:
+            live_strategy_ids = {strategy.strategy_id for strategy in self._strategies}
+
+        cleaned = 0
+        for row in self._data_mgr.query_orders() or []:
+            if str(row.get("status", "") or "") not in active_statuses:
+                continue
+
+            strategy_id = str(row.get("strategy_id", "") or "")
+            if strategy_id in live_strategy_ids:
+                continue
+
+            xt_order_id = int(row.get("xt_order_id", 0) or 0)
+            filled_quantity = int(row.get("filled_quantity", 0) or 0)
+            if xt_order_id > 0 or filled_quantity > 0:
+                continue
+
+            order = self._deserialize_order_row(row)
+            order.status = OrderStatus.CANCELED
+            order.status_msg = "startup cleanup orphan pending order without live strategy"
+            self._data_mgr.save_order(order)
+            cleaned += 1
+
+        if cleaned > 0:
+            logger.info("StrategyRunner: 已清理 %d 个未被活策略接管的本地待报挂单", cleaned)
+        return cleaned
+
     @staticmethod
     def _deserialize_order_row(row: dict) -> Order:
         """把数据库行反序列化成内部 Order 对象。"""
         return Order(
             order_uuid=str(row.get("order_uuid", "") or ""),
+            order_trace_id=str(row.get("order_trace_id", "") or ""),
             strategy_id=str(row.get("strategy_id", "") or ""),
             strategy_name=str(row.get("strategy_name", "") or ""),
             stock_code=str(row.get("stock_code", "") or ""),
@@ -971,6 +1043,115 @@ class StrategyRunner:
         strategy = self.get_strategy(order.strategy_id)
         if strategy:
             strategy.on_order_update(order)
+
+    def _sync_orders_and_trades_job(self) -> None:
+        """仅在交易时段运行主动同步，补偿漏回报场景。"""
+        if not self._running or not self.is_trading_time():
+            return
+        self.sync_orders_and_trades_once(reason="scheduler")
+
+    def sync_orders_and_trades_once(self, reason: str = "manual") -> Dict[str, int]:
+        """主动拉取账户委托/成交并纠正本地状态。"""
+        summary = {
+            "trades_synced": 0,
+            "orders_synced": 0,
+            "state_recovered": 0,
+        }
+        if not self._connection_mgr or not self._connection_mgr.is_connected() or not self._order_mgr:
+            return summary
+
+        try:
+            queried_trades = self._connection_mgr.query_stock_trades()
+            summary["trades_synced"] = self._sync_trades_from_account(queried_trades)
+        except Exception as exc:
+            logger.warning("StrategyRunner: 主动同步成交失败 reason=%s err=%s", reason, exc)
+
+        try:
+            queried_orders = self._connection_mgr.query_stock_orders(cancelable_only=False)
+            sync_result = self._sync_orders_from_account(queried_orders)
+            summary["orders_synced"] = sync_result["orders_synced"]
+            summary["state_recovered"] = sync_result["state_recovered"]
+        except Exception as exc:
+            logger.warning("StrategyRunner: 主动同步委托失败 reason=%s err=%s", reason, exc)
+
+        if any(summary.values()):
+            logger.info(
+                "StrategyRunner: 主动同步完成 reason=%s trades=%d orders=%d recovered=%d",
+                reason,
+                summary["trades_synced"],
+                summary["orders_synced"],
+                summary["state_recovered"],
+            )
+            self.request_state_persist(f"sync_orders_and_trades:{reason}")
+        return summary
+
+    def cancel_entry_orders_and_recover(self, strategy_id: str, remark: str = "") -> Dict[str, object]:
+        """人工撤销未成交建仓单，并在安全时恢复公平竞争状态。"""
+        strategy = self.get_strategy(strategy_id)
+        if not strategy:
+            return {"success": False, "message": "策略不存在"}
+
+        self.sync_orders_and_trades_once(reason=f"manual_release_precheck:{strategy_id}")
+
+        position = self._position_mgr.get_position(strategy_id) if self._position_mgr else None
+        total_quantity = int(getattr(position, "total_quantity", 0) or 0)
+        if total_quantity > 0:
+            return {"success": False, "message": "策略仍有持仓，不能恢复为未开仓竞争状态"}
+
+        active_buy_orders = [
+            order for order in self._order_mgr.get_orders_by_strategy(strategy_id)
+            if order.direction == OrderDirection.BUY and order.is_active()
+        ]
+        if not active_buy_orders:
+            recovered = 1 if self._recover_strategy_after_entry_release(strategy) else 0
+            return {
+                "success": True,
+                "message": "当前无活动买单，已收敛策略状态",
+                "submitted": 0,
+                "forced": 0,
+                "recovered": recovered,
+            }
+
+        if any(int(getattr(order, "filled_quantity", 0) or 0) > 0 for order in active_buy_orders):
+            return {"success": False, "message": "存在已成交买单，不能直接恢复为未开仓状态"}
+
+        submitted = 0
+        forced = 0
+        for order in active_buy_orders:
+            if int(getattr(order, "xt_order_id", 0) or 0) > 0 and self._trade_exec:
+                canceled = bool(self._trade_exec.cancel_order(order.order_uuid, remark=remark or "人工撤销建仓单并释放名额"))
+                if canceled:
+                    submitted += 1
+                continue
+
+            updated = self._order_mgr.mark_order_status(
+                order.order_uuid,
+                OrderStatus.CANCELED,
+                status_msg=remark or "人工清理未被柜台接收的建仓单",
+            )
+            if updated:
+                forced += 1
+
+        recovered = 0
+
+        if submitted == 0 and forced == 0:
+            return {"success": False, "message": "没有成功撤销任何活动买单"}
+
+        if submitted > 0 and forced == 0:
+            message = f"已提交 {submitted} 笔撤单请求，待柜台回报后自动释放名额"
+        elif submitted == 0:
+            message = f"已本地清理 {forced} 笔未入柜台买单，并恢复策略竞争状态"
+        else:
+            message = f"已提交 {submitted} 笔撤单，并本地清理 {forced} 笔未入柜台买单"
+
+        self.request_state_persist(f"manual_release_entry:{strategy_id}")
+        return {
+            "success": True,
+            "message": message,
+            "submitted": submitted,
+            "forced": forced,
+            "recovered": recovered,
+        }
 
     def _build_account_position_map(self) -> Dict[str, Dict[str, int]]:
         """查询并标准化账户持仓映射。"""
@@ -1137,7 +1318,7 @@ class StrategyRunner:
 
         current_available_map = {
             str(pos.strategy_id or ""): min(
-                max(0, int(getattr(pos, "available_quantity", 0) or 0)),
+                max(0, int(getattr(pos, "sellable_base_quantity", getattr(pos, "available_quantity", 0)) or 0)),
                 max(0, int(getattr(pos, "total_quantity", 0) or 0)),
             )
             for pos in valid_positions
@@ -1196,6 +1377,189 @@ class StrategyRunner:
                 reason,
             )
 
+    def _sync_trades_from_account(self, queried_trades: List[object]) -> int:
+        """把账户成交查询结果补灌回内部订单/持仓链路。"""
+        if not queried_trades:
+            return 0
+
+        recorded_trade_ids = self._get_known_trade_ids()
+
+        synced = 0
+        for trade in queried_trades:
+            trade_id = str(getattr(trade, "traded_id", "") or getattr(trade, "trade_id", "") or "")
+            if not trade_id or trade_id in recorded_trade_ids:
+                continue
+
+            xt_order_id = int(getattr(trade, "order_id", 0) or 0)
+            trade_info = {
+                "account_type": int(getattr(trade, "account_type", 0) or 0),
+                "account_id": str(getattr(trade, "account_id", "") or ""),
+                "strategy_id": str(getattr(trade, "strategy_id", "") or ""),
+                "stock_code": self._xt_to_code(str(getattr(trade, "stock_code", "") or "")),
+                "order_type": int(getattr(trade, "order_type", 0) or 0),
+                "traded_id": trade_id,
+                "traded_time": int(getattr(trade, "traded_time", 0) or 0),
+                "traded_price": float(getattr(trade, "traded_price", 0) or 0.0),
+                "traded_volume": int(getattr(trade, "traded_volume", 0) or 0),
+                "traded_amount": float(getattr(trade, "traded_amount", 0) or 0.0),
+                "order_id": xt_order_id,
+                "order_sysid": str(getattr(trade, "order_sysid", "") or ""),
+                "strategy_name": str(getattr(trade, "strategy_name", "") or ""),
+                "order_remark": str(getattr(trade, "order_remark", "") or ""),
+                "direction": int(getattr(trade, "direction", 0) or 0),
+                "offset_flag": int(getattr(trade, "offset_flag", 0) or 0),
+                "commission": float(getattr(trade, "commission", 0.0) or 0.0),
+                "secu_account": str(getattr(trade, "secu_account", "") or ""),
+                "instrument_name": str(getattr(trade, "instrument_name", "") or ""),
+                "xt_fields": self._extract_public_attrs(trade),
+            }
+            trade_info.update({
+                "trade_id": trade_id,
+                "xt_order_id": xt_order_id,
+                "price": trade_info["traded_price"],
+                "quantity": trade_info["traded_volume"],
+                "amount": trade_info["traded_amount"],
+            })
+            self._order_mgr.on_trade(xt_order_id, trade_info)
+            recorded_trade_ids.add(trade_id)
+            synced += 1
+        return synced
+
+    def _get_known_trade_ids(self) -> set[str]:
+        """返回已知成交 ID 集合，并在首次使用时从数据库预热。"""
+        if self._known_trade_ids is None:
+            known_trade_ids: set[str] = set()
+            if self._data_mgr:
+                known_trade_ids = {
+                    str(row.get("trade_id", "") or "")
+                    for row in self._data_mgr.query_trades()
+                    if str(row.get("trade_id", "") or "")
+                }
+            self._known_trade_ids = known_trade_ids
+        return self._known_trade_ids
+
+    def _sync_orders_from_account(self, queried_orders: List[object]) -> Dict[str, int]:
+        """把账户委托查询结果回写到本地订单状态。"""
+        summary = {"orders_synced": 0, "state_recovered": 0}
+        if not queried_orders:
+            return summary
+
+        seen_xt_order_ids: set[int] = set()
+        seen_trace_ids: set[str] = set()
+
+        for queried_order in queried_orders:
+            xt_order_id = int(getattr(queried_order, "order_id", 0) or 0)
+            if xt_order_id <= 0:
+                continue
+
+            seen_xt_order_ids.add(xt_order_id)
+            order_trace_id = str(getattr(queried_order, "order_remark", "") or "").strip()
+            if order_trace_id:
+                seen_trace_ids.add(order_trace_id)
+
+            local_order = self._order_mgr.get_order_by_xt_id(xt_order_id)
+            if not local_order:
+                local_order = self._order_mgr.get_order_by_trace_id(order_trace_id)
+            if not local_order:
+                continue
+
+            next_status = self._map_xt_order_status(getattr(queried_order, "order_status", 0))
+            filled_qty = int(getattr(queried_order, "traded_volume", 0) or 0)
+            filled_amount = float(getattr(queried_order, "traded_amount", 0) or 0.0)
+            avg_price = float(getattr(queried_order, "traded_price", 0) or 0.0)
+            changed = (
+                local_order.status != next_status
+                or int(getattr(local_order, "filled_quantity", 0) or 0) != filled_qty
+                or abs(float(getattr(local_order, "filled_amount", 0.0) or 0.0) - filled_amount) > 1e-6
+                or abs(float(getattr(local_order, "filled_avg_price", 0.0) or 0.0) - avg_price) > 1e-6
+            )
+            if not changed:
+                continue
+
+            before_terminal = local_order.status in (
+                OrderStatus.SUCCEEDED,
+                OrderStatus.CANCELED,
+                OrderStatus.PART_CANCEL,
+                OrderStatus.JUNK,
+                OrderStatus.UNKNOWN,
+            )
+            self._order_mgr.update_order_status(
+                xt_order_id=xt_order_id,
+                status=next_status,
+                filled_qty=filled_qty,
+                filled_amount=filled_amount,
+                avg_price=avg_price,
+                order_info=self._build_xt_order_payload(queried_order),
+            )
+            summary["orders_synced"] += 1
+            if not before_terminal and next_status in (
+                OrderStatus.SUCCEEDED,
+                OrderStatus.CANCELED,
+                OrderStatus.PART_CANCEL,
+                OrderStatus.JUNK,
+                OrderStatus.UNKNOWN,
+            ):
+                summary["state_recovered"] += 1
+
+        for local_order in self._order_mgr.get_active_orders():
+            if self._should_keep_local_active_order(local_order, seen_xt_order_ids, seen_trace_ids):
+                continue
+
+            updated_order = self._order_mgr.mark_order_status(
+                local_order.order_uuid,
+                self._resolve_missing_active_order_status(local_order),
+                status_msg="主动同步未在柜台委托列表中找到该活动订单，已按保护规则收敛为终态",
+            )
+            if not updated_order:
+                continue
+
+            summary["orders_synced"] += 1
+            summary["state_recovered"] += 1
+            strategy = self.get_strategy(updated_order.strategy_id)
+            if strategy:
+                self._recover_strategy_after_entry_release(strategy)
+        return summary
+
+    @staticmethod
+    def _should_keep_local_active_order(
+        local_order: Order,
+        seen_xt_order_ids: set[int],
+        seen_trace_ids: set[str],
+    ) -> bool:
+        """判断本地活动单是否已在柜台委托列表中出现。"""
+        xt_order_id = int(getattr(local_order, "xt_order_id", 0) or 0)
+        if xt_order_id > 0 and xt_order_id in seen_xt_order_ids:
+            return True
+        order_trace_id = str(getattr(local_order, "order_trace_id", "") or "").strip()
+        return bool(order_trace_id and order_trace_id in seen_trace_ids)
+
+    @staticmethod
+    def _resolve_missing_active_order_status(local_order: Order) -> OrderStatus:
+        """为“柜台侧不存在”的本地活动单选择收敛终态。"""
+        if int(getattr(local_order, "filled_quantity", 0) or 0) > 0:
+            return OrderStatus.PART_CANCEL
+        if int(getattr(local_order, "xt_order_id", 0) or 0) > 0:
+            return OrderStatus.CANCELED
+        return OrderStatus.JUNK
+
+    def _recover_strategy_after_entry_release(self, strategy: BaseStrategy) -> bool:
+        """在无持仓且无活动买单时，把策略收敛回正确状态。"""
+        if not strategy or strategy.status == StrategyStatus.STOPPED:
+            return False
+
+        position = self._position_mgr.get_position(strategy.strategy_id) if self._position_mgr else None
+        if position and int(getattr(position, "total_quantity", 0) or 0) > 0:
+            return False
+
+        if any(
+            order.direction == OrderDirection.BUY and order.is_active()
+            for order in self._order_mgr.get_orders_by_strategy(strategy.strategy_id)
+        ):
+            return False
+
+        strategy.recover_unfilled_entry_state()
+        return True
+
     def _warn_preflight(self, message: str) -> None:
         """统一处理启动前校验警告：同时写日志并发送告警。"""
         logger.warning(message)
@@ -1204,6 +1568,69 @@ class StrategyRunner:
                 self._alert_callback(AlertLevel.WARNING, message)
             except Exception as exc:
                 logger.error("StrategyRunner: 启动前告警发送失败: %s", exc, exc_info=True)
+
+    @staticmethod
+    def _map_xt_order_status(xt_status) -> OrderStatus:
+        """将 xtquant 原始订单状态码映射为内部状态。"""
+        mapping = {
+            48: OrderStatus.UNREPORTED,
+            49: OrderStatus.WAIT_REPORTING,
+            50: OrderStatus.REPORTED,
+            51: OrderStatus.REPORTED_CANCEL,
+            52: OrderStatus.PARTSUCC_CANCEL,
+            53: OrderStatus.PART_CANCEL,
+            54: OrderStatus.CANCELED,
+            55: OrderStatus.PART_SUCC,
+            56: OrderStatus.SUCCEEDED,
+            57: OrderStatus.JUNK,
+            255: OrderStatus.UNKNOWN,
+        }
+        return mapping.get(int(xt_status or 0), OrderStatus.UNKNOWN)
+
+    @staticmethod
+    def _extract_public_attrs(payload) -> Dict[str, object]:
+        """提取对象上的公开属性，便于调试和持久化。"""
+        data: Dict[str, object] = {}
+        if payload is None:
+            return data
+        for attr in dir(payload):
+            if attr.startswith("_"):
+                continue
+            try:
+                value = getattr(payload, attr)
+            except Exception:
+                continue
+            if callable(value):
+                continue
+            data[attr] = value
+        return data
+
+    def _build_xt_order_payload(self, order) -> Dict[str, object]:
+        """把查询得到的 XtOrder 对象转换成统一 dict。"""
+        return {
+            "account_type": int(getattr(order, "account_type", 0) or 0),
+            "account_id": str(getattr(order, "account_id", "") or ""),
+            "xt_stock_code": str(getattr(order, "stock_code", "") or ""),
+            "stock_code": self._xt_to_code(str(getattr(order, "stock_code", "") or "")),
+            "order_sysid": str(getattr(order, "order_sysid", "") or ""),
+            "order_time": int(getattr(order, "order_time", 0) or 0),
+            "order_type": int(getattr(order, "order_type", 0) or 0),
+            "price_type": int(getattr(order, "price_type", 0) or 0),
+            "order_status": int(getattr(order, "order_status", 0) or 0),
+            "status_msg": str(getattr(order, "status_msg", "") or ""),
+            "direction": int(getattr(order, "direction", 0) or 0),
+            "offset_flag": int(getattr(order, "offset_flag", 0) or 0),
+            "secu_account": str(getattr(order, "secu_account", "") or ""),
+            "instrument_name": str(getattr(order, "instrument_name", "") or ""),
+            "order_volume": int(getattr(order, "order_volume", 0) or 0),
+            "price": float(getattr(order, "price", 0.0) or 0.0),
+            "traded_volume": int(getattr(order, "traded_volume", 0) or 0),
+            "traded_amount": float(getattr(order, "traded_amount", 0.0) or 0.0),
+            "traded_price": float(getattr(order, "traded_price", 0.0) or 0.0),
+            "strategy_name": str(getattr(order, "strategy_name", "") or ""),
+            "order_remark": str(getattr(order, "order_remark", "") or ""),
+            "xt_fields": self._extract_public_attrs(order),
+        }
 
     @staticmethod
     def _xt_to_code(xt_code: str) -> str:

@@ -44,6 +44,8 @@ class OrderManager:
         self._fee_schedule = fee_schedule
         # ``_orders`` 保存全部内部订单对象，键为内部 UUID。
         self._orders: Dict[str, Order] = {}                  # {order_uuid: Order}
+        # ``_trace_to_uuid`` 用于把 xt `order_remark` 里的 23 位跟踪标识反查回内部订单 UUID。
+        self._trace_to_uuid: Dict[str, str] = {}            # {order_trace_id: order_uuid}
         # ``_xt_to_uuid`` 用于把柜台订单号反查回内部订单 UUID。
         self._xt_to_uuid: Dict[int, str] = {}               # {xt_order_id: order_uuid}
         # ``_seq_to_uuid`` 用于异步下单时，先用 seq 暂存本地订单映射。
@@ -56,6 +58,8 @@ class OrderManager:
         self._trade_callback: Optional[Callable[[TradeRecord], None]] = None
         # ``_state_change_callback`` 用于在订单生命周期变化后触发策略快照持久化。
         self._state_change_callback: Optional[Callable[[str], None]] = None
+        # ``_known_trade_ids`` 用于成交幂等保护，避免同一 trade_id 被重复记账。
+        self._known_trade_ids: Optional[set[str]] = None
         # ``_lock`` 保护订单字典和映射字典在多线程环境下的一致性。
         self._lock = threading.Lock()
 
@@ -69,6 +73,8 @@ class OrderManager:
         """
         with self._lock:
             self._orders[order.order_uuid] = order
+            if str(getattr(order, "order_trace_id", "") or ""):
+                self._trace_to_uuid[str(order.order_trace_id)] = order.order_uuid
             if order.xt_order_id:
                 # 有真实 xt_order_id 时，立即建立“柜台号 -> 内部 UUID”的反查映射。
                 self._xt_to_uuid[order.xt_order_id] = order.order_uuid
@@ -77,10 +83,17 @@ class OrderManager:
                 self._data_mgr.save_order(order)
             except Exception as e:
                 logger.error("OrderManager: 持久化订单失败: %s", e, exc_info=True)
-        logger.info("[ORDER] 注册订单 uuid=%s%s code=%s dir=%s price=%.3f qty=%d remark=%s",
-                    order.order_uuid[:8], f" xt_id={order.xt_order_id}" if order.xt_order_id else "",
-                    order.stock_code, order.direction.value,
-                    order.price, order.quantity, order.remark)
+        logger.info(
+            "[ORDER] 注册订单 uuid=%s trace=%s%s code=%s dir=%s price=%.3f qty=%d remark=%s",
+            order.order_uuid[:8],
+            str(getattr(order, "order_trace_id", "") or ""),
+            f" xt_id={order.xt_order_id}" if order.xt_order_id else "",
+            order.stock_code,
+            order.direction.value,
+            order.price,
+            order.quantity,
+            order.remark,
+        )
         self._notify_state_change(f"register_order:{order.order_uuid}")
 
     # ------------------------------------------------------------------ 状态更新
@@ -100,6 +113,8 @@ class OrderManager:
         """
         with self._lock:
             uuid = self._xt_to_uuid.get(xt_order_id)
+            if not uuid and order_info:
+                uuid = self._bind_xt_order_id_by_trace_id(xt_order_id, str(order_info.get("order_remark", "") or ""))
             if not uuid:
                 # 柜台先推状态、后绑定映射时，可能暂时找不到本地订单，直接忽略等待后续回报。
                 return
@@ -153,8 +168,15 @@ class OrderManager:
         6. 通知持仓模块、前端推送模块、策略模块。
         """
         try:
+            trade_id = str(trade_info.get("traded_id", trade_info.get("trade_id", "")) or "").strip()
+            if trade_id and self._is_duplicate_trade_id(trade_id):
+                logger.info("[ORDER] [TRADE] 忽略重复成交 trade_id=%s xt_order_id=%s", trade_id, xt_order_id)
+                return
+
             with self._lock:
                 uuid = self._xt_to_uuid.get(xt_order_id)
+                if not uuid:
+                    uuid = self._bind_xt_order_id_by_trace_id(xt_order_id, str(trade_info.get("order_remark", "") or ""))
                 order = self._orders.get(uuid) if uuid else None
 
             # 如果能找到原订单，就尽量沿用原订单上的 strategy_id/strategy_name；
@@ -191,14 +213,16 @@ class OrderManager:
                 account_type=int(trade_info.get("account_type", 0) or 0),
                 account_id=str(trade_info.get("account_id", "") or ""),
                 order_type=xt_order_type,
-                trade_id=str(trade_info.get("traded_id", trade_info.get("trade_id", "")) or ""),
+                trade_id=trade_id,
                 xt_traded_time=xt_traded_time,
                 order_uuid=uuid or "",
+                order_trace_id=(getattr(order, "order_trace_id", "") if order else str(trade_info.get("order_remark", "") or "")),
                 xt_order_id=xt_order_id,
                 order_sysid=str(trade_info.get("order_sysid", "") or ""),
                 strategy_id=strategy_id,
                 strategy_name=strategy_name,
                 order_remark=str(trade_info.get("order_remark", "") or ""),
+                remark=(getattr(order, "remark", "") if order else str(trade_info.get("remark", "") or "")),
                 stock_code=str(trade_info.get("stock_code", "") or ""),
                 direction=direction,
                 xt_direction=xt_direction,
@@ -271,10 +295,42 @@ class OrderManager:
 
             logger.info("[ORDER] [TRADE] 成交 uuid=%s code=%s price=%.3f qty=%d",
                         (uuid or "?")[:8], trade.stock_code, trade.price, trade.quantity)
+            if trade_id:
+                self._mark_trade_id_seen(trade_id)
             self._notify_state_change(f"trade:{uuid or xt_order_id}")
 
         except Exception as e:
             logger.error("OrderManager: on_trade 处理异常: %s", e, exc_info=True)
+
+    def _is_duplicate_trade_id(self, trade_id: str) -> bool:
+        """判断某个成交编号是否已经被处理过。"""
+        normalized = str(trade_id or "").strip()
+        if not normalized:
+            return False
+        return normalized in self._get_known_trade_ids()
+
+    def _mark_trade_id_seen(self, trade_id: str) -> None:
+        """把成交编号登记为已处理。"""
+        normalized = str(trade_id or "").strip()
+        if not normalized:
+            return
+        self._get_known_trade_ids().add(normalized)
+
+    def _get_known_trade_ids(self) -> set[str]:
+        """懒加载已知成交编号集合，兼容重启后的历史去重。"""
+        if self._known_trade_ids is None:
+            known_trade_ids: set[str] = set()
+            if self._data_mgr:
+                try:
+                    known_trade_ids = {
+                        str(row.get("trade_id", "") or "").strip()
+                        for row in (self._data_mgr.query_trades() or [])
+                        if str(row.get("trade_id", "") or "").strip()
+                    }
+                except Exception as exc:
+                    logger.warning("OrderManager: 预热成交去重集合失败: %s", exc)
+            self._known_trade_ids = known_trade_ids
+        return self._known_trade_ids
 
     @staticmethod
     def _infer_trade_direction(offset_flag: int, order_type: int, xt_direction: int,
@@ -366,12 +422,15 @@ class OrderManager:
         order.secu_account = str(order_info.get("secu_account", "") or "")
         order.instrument_name = str(order_info.get("instrument_name", "") or "")
         order.xt_fields = dict(order_info.get("xt_fields", {}) or {})
+        trace_id = str(order_info.get("order_remark", "") or "").strip()
+        if trace_id and not str(getattr(order, "order_trace_id", "") or ""):
+            order.order_trace_id = trace_id
+        if trace_id:
+            self._trace_to_uuid[trace_id] = order.order_uuid
         if not order.stock_code:
             order.stock_code = str(order_info.get("stock_code", "") or "")
         if not order.strategy_name:
             order.strategy_name = str(order_info.get("strategy_name", "") or "")
-        if not order.remark:
-            order.remark = str(order_info.get("order_remark", "") or "")
         if not order.quantity:
             order.quantity = int(order_info.get("order_volume", 0) or 0)
         if not order.price:
@@ -446,6 +505,47 @@ class OrderManager:
         logger.debug("OrderManager: async_response seq=%d → xt_id=%d", seq, xt_order_id)
         self._notify_state_change(f"async_response:{xt_order_id}")
 
+    def mark_order_status(self, order_uuid: str, status: OrderStatus,
+                          status_msg: str = "", order_info: Optional[dict] = None,
+                          filled_qty: Optional[int] = None,
+                          filled_amount: Optional[float] = None,
+                          avg_price: Optional[float] = None) -> Optional[Order]:
+        """直接按内部 UUID 修正订单状态。"""
+        with self._lock:
+            order = self._orders.get(order_uuid)
+            if not order:
+                return None
+
+            if order_info:
+                self._apply_xt_order_fields(order, order_info)
+
+            order.status = status
+            if status_msg:
+                order.status_msg = str(status_msg)
+            if filled_qty is not None:
+                order.filled_quantity = int(filled_qty or 0)
+            if filled_amount is not None:
+                order.filled_amount = float(filled_amount or 0.0)
+            if avg_price is not None:
+                order.filled_avg_price = float(avg_price or 0.0)
+            self._recalculate_order_fee(order)
+            order.update_time = datetime.now()
+
+        if self._data_mgr:
+            try:
+                self._data_mgr.save_order(order)
+            except Exception as e:
+                logger.error("OrderManager: 强制更新订单持久化失败: %s", e, exc_info=True)
+
+        if self._strategy_callback:
+            try:
+                self._strategy_callback(order)
+            except Exception as e:
+                logger.error("OrderManager: 强制更新策略回调异常: %s", e, exc_info=True)
+
+        self._notify_state_change(f"mark_order_status:{order_uuid}")
+        return order
+
     def register_seq(self, seq: int, order_uuid: str) -> None:
         """为异步下单预注册 `seq -> order_uuid` 映射。"""
         with self._lock:
@@ -462,6 +562,12 @@ class OrderManager:
         """按柜台订单号获取订单。"""
         with self._lock:
             uuid = self._xt_to_uuid.get(xt_order_id)
+            return self._orders.get(uuid) if uuid else None
+
+    def get_order_by_trace_id(self, order_trace_id: str) -> Optional[Order]:
+        """按 23 位跟踪标识获取订单。"""
+        with self._lock:
+            uuid = self._trace_to_uuid.get(str(order_trace_id or ""))
             return self._orders.get(uuid) if uuid else None
 
     def get_orders_by_strategy(self, strategy_id: str) -> List[Order]:
@@ -497,8 +603,30 @@ class OrderManager:
         with self._lock:
             for order in orders:
                 self._orders[order.order_uuid] = order
+                if str(getattr(order, "order_trace_id", "") or ""):
+                    self._trace_to_uuid[str(order.order_trace_id)] = order.order_uuid
                 if int(order.xt_order_id or 0) > 0:
                     self._xt_to_uuid[int(order.xt_order_id)] = order.order_uuid
+
+    def _bind_xt_order_id_by_trace_id(self, xt_order_id: int, order_trace_id: str) -> Optional[str]:
+        """当异步响应丢失时，尝试用 xt `order_remark` 回查并补绑柜台订单号。"""
+        trace_id = str(order_trace_id or "").strip()
+        if not trace_id:
+            return None
+
+        uuid = self._trace_to_uuid.get(trace_id)
+        if not uuid:
+            return None
+
+        order = self._orders.get(uuid)
+        if not order:
+            return None
+
+        self._xt_to_uuid[int(xt_order_id)] = uuid
+        order.xt_order_id = int(xt_order_id or 0)
+        if not str(getattr(order, "order_trace_id", "") or ""):
+            order.order_trace_id = trace_id
+        return uuid
 
     def _notify_state_change(self, reason: str) -> None:
         """在订单生命周期发生变化后通知上层保存最新快照。"""

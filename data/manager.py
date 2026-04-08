@@ -11,7 +11,7 @@ import json
 import sqlite3
 import threading
 from dataclasses import asdict, is_dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from core.trading_calendar import minus_one_market_day
@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS trades (
     order_sysid  TEXT DEFAULT '',
     strategy_name TEXT NOT NULL,
     strategy_id  TEXT NOT NULL,
+    order_trace_id TEXT DEFAULT '',
     order_remark TEXT DEFAULT '',
     stock_code   TEXT NOT NULL,
     direction    TEXT NOT NULL,
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS orders (
     account_id      TEXT DEFAULT '',
     strategy_name   TEXT NOT NULL,
     strategy_id     TEXT NOT NULL,
+    order_trace_id  TEXT DEFAULT '',
     stock_code      TEXT NOT NULL,
     xt_stock_code   TEXT DEFAULT '',
     direction       TEXT NOT NULL,
@@ -101,6 +103,7 @@ CREATE TABLE IF NOT EXISTS positions (
     strategy_name    TEXT NOT NULL,
     stock_code       TEXT NOT NULL,
     total_quantity   INTEGER DEFAULT 0,
+    sellable_base_quantity INTEGER DEFAULT 0,
     available_quantity INTEGER DEFAULT 0,
     is_t0            INTEGER DEFAULT 0,
     avg_cost         REAL DEFAULT 0,
@@ -205,9 +208,11 @@ class DataManager:
         try:
             with self._get_conn() as conn:
                 conn.executescript(_DDL)
+                self._migrate_position_extra_columns(conn)
                 self._migrate_xt_order_id_columns(conn)
                 self._migrate_trade_extra_columns(conn)
                 self._migrate_order_extra_columns(conn)
+                self._migrate_legacy_order_timestamp_timezone(conn)
             logger.info("DataManager: SQLite 初始化完成 — %s", self._db_path)
         except Exception as e:
             logger.error("DataManager: 初始化数据库失败: %s", e, exc_info=True)
@@ -215,14 +220,19 @@ class DataManager:
 
     def save_trade(self, trade) -> None:
         """保存一条成交记录到 SQLite。"""
+        trade_id = str(getattr(trade, "trade_id", "") or "").strip()
+        if trade_id:
+            existing = self._fetchall("SELECT 1 FROM trades WHERE trade_id = ? LIMIT 1", [trade_id])
+            if existing:
+                return
         sql = """
         INSERT INTO trades
           (account_type, account_id, order_type, trade_id, traded_time,
            order_uuid, xt_order_id, order_sysid, strategy_name, strategy_id,
-           order_remark, stock_code, direction, xt_direction, offset_flag,
-              quantity, price, amount, commission, buy_commission, sell_commission,
-              stamp_tax, total_fee, is_t0, trade_time)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     order_trace_id, order_remark, stock_code, direction, xt_direction, offset_flag,
+                            quantity, price, amount, commission, buy_commission, sell_commission,
+                            stamp_tax, total_fee, is_t0, remark, trade_time)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """
         params = (
             int(getattr(trade, "account_type", 0) or 0),
@@ -235,6 +245,7 @@ class DataManager:
             str(getattr(trade, "order_sysid", "") or ""),
             trade.strategy_name,
             trade.strategy_id,
+            str(getattr(trade, "order_trace_id", "") or ""),
             str(getattr(trade, "order_remark", "") or ""),
             trade.stock_code,
             str(trade.direction.value),
@@ -249,6 +260,7 @@ class DataManager:
             float(getattr(trade, "stamp_tax", 0.0) or 0.0),
             float(getattr(trade, "total_fee", 0.0) or 0.0),
             1 if bool(getattr(trade, "is_t0", False)) else 0,
+            str(getattr(trade, "remark", "") or ""),
             self._to_yyyymmdd(trade.trade_time)
         )
         self._execute(sql, params)
@@ -259,19 +271,23 @@ class DataManager:
         这里使用 ``ON CONFLICT``，这样同一订单既能插入也能更新，
         适合订单状态不断变化的场景。
         """
+        create_time = getattr(order, "create_time", None) or datetime.now()
+        update_time = getattr(order, "update_time", None) or datetime.now()
         sql = """
         INSERT INTO orders
                     (order_uuid, xt_order_id, account_type, account_id, strategy_name, strategy_id,
+                     order_trace_id,
                      stock_code, xt_stock_code, direction, order_type, xt_order_type, price_type,
                      price, quantity, amount, status, xt_order_status, status_msg, order_sysid,
                      order_time, xt_direction, offset_flag, secu_account, instrument_name,
                      filled_quantity, filled_amount, filled_avg_price, commission, buy_commission,
-                     sell_commission, stamp_tax, total_fee, remark, xt_order_snapshot)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     sell_commission, stamp_tax, total_fee, remark, xt_order_snapshot, create_time, update_time)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(order_uuid) DO UPDATE SET
           xt_order_id     = excluded.xt_order_id,
                     account_type    = excluded.account_type,
                     account_id      = excluded.account_id,
+                    order_trace_id  = excluded.order_trace_id,
                     xt_stock_code   = excluded.xt_stock_code,
           status          = excluded.status,
                     xt_order_status = excluded.xt_order_status,
@@ -292,8 +308,10 @@ class DataManager:
                     sell_commission = excluded.sell_commission,
                     stamp_tax       = excluded.stamp_tax,
                     total_fee       = excluded.total_fee,
+                                        remark          = excluded.remark,
                     xt_order_snapshot = excluded.xt_order_snapshot,
-          update_time     = CURRENT_TIMESTAMP
+                                        create_time     = excluded.create_time,
+                                        update_time     = excluded.update_time
         """
         params = (
                         order.order_uuid,
@@ -302,6 +320,7 @@ class DataManager:
                         str(getattr(order, "account_id", "") or ""),
                         order.strategy_name,
                         order.strategy_id,
+                                                str(getattr(order, "order_trace_id", "") or ""),
                         order.stock_code,
                         str(getattr(order, "xt_stock_code", "") or ""),
                         str(order.direction.value),
@@ -330,6 +349,8 @@ class DataManager:
                         float(getattr(order, "total_fee", 0.0) or 0.0),
                         order.remark,
                         self._json_dumps(getattr(order, "xt_fields", {}) or {}),
+                        getattr(create_time, "isoformat", lambda sep="T": datetime.now().isoformat(sep=sep))(sep=" "),
+                        getattr(update_time, "isoformat", lambda sep="T": datetime.now().isoformat(sep=sep))(sep=" "),
         )
         self._execute(sql, params)
 
@@ -365,16 +386,17 @@ class DataManager:
 
         sql = """
         INSERT INTO positions
-            (strategy_id, strategy_name, stock_code, total_quantity, available_quantity,
+            (strategy_id, strategy_name, stock_code, total_quantity, sellable_base_quantity, available_quantity,
              is_t0, avg_cost, total_cost, current_price, market_value,
              unrealized_pnl, unrealized_pnl_ratio, realized_pnl, total_commission,
              total_buy_commission, total_sell_commission, total_stamp_tax,
              total_fees, fifo_lots_json, update_time)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(strategy_id) DO UPDATE SET
             strategy_name = excluded.strategy_name,
             stock_code = excluded.stock_code,
             total_quantity = excluded.total_quantity,
+            sellable_base_quantity = excluded.sellable_base_quantity,
             available_quantity = excluded.available_quantity,
             is_t0 = excluded.is_t0,
             avg_cost = excluded.avg_cost,
@@ -397,6 +419,7 @@ class DataManager:
             str(getattr(position, "strategy_name", "") or ""),
             str(getattr(position, "stock_code", "") or ""),
             int(getattr(position, "total_quantity", 0) or 0),
+            int(getattr(position, "sellable_base_quantity", getattr(position, "available_quantity", 0)) or 0),
             int(getattr(position, "available_quantity", 0) or 0),
             1 if bool(getattr(position, "is_t0", False)) else 0,
             float(getattr(position, "avg_cost", 0.0) or 0.0),
@@ -827,6 +850,7 @@ class DataManager:
                 "strategy_name": str(getattr(position, "strategy_name", "") or ""),
                 "stock_code": str(getattr(position, "stock_code", "") or ""),
                 "total_quantity": int(getattr(position, "total_quantity", 0) or 0),
+                "sellable_base_quantity": int(getattr(position, "sellable_base_quantity", getattr(position, "available_quantity", 0)) or 0),
                 "available_quantity": int(getattr(position, "available_quantity", 0) or 0),
                 "is_t0": bool(getattr(position, "is_t0", False)),
                 "avg_cost": float(getattr(position, "avg_cost", 0.0) or 0.0),
@@ -913,6 +937,7 @@ class DataManager:
                 strategy_name=str(position_payload.get("strategy_name", "") or ""),
                 stock_code=str(position_payload.get("stock_code", "") or ""),
                 total_quantity=int(position_payload.get("total_quantity", 0) or 0),
+                sellable_base_quantity=int(position_payload.get("sellable_base_quantity", position_payload.get("available_quantity", 0)) or 0),
                 available_quantity=int(position_payload.get("available_quantity", 0) or 0),
                 is_t0=bool(position_payload.get("is_t0", False)),
                 avg_cost=float(position_payload.get("avg_cost", 0.0) or 0.0),
@@ -1093,6 +1118,7 @@ class DataManager:
             "order_type": "INTEGER DEFAULT 0",
             "traded_time": "INTEGER DEFAULT 0",
             "order_sysid": "TEXT DEFAULT ''",
+            "order_trace_id": "TEXT DEFAULT ''",
             "order_remark": "TEXT DEFAULT ''",
             "xt_direction": "INTEGER DEFAULT 0",
             "offset_flag": "INTEGER DEFAULT 0",
@@ -1107,6 +1133,18 @@ class DataManager:
                 conn.execute(f"ALTER TABLE trades ADD COLUMN {name} {ddl}")
 
     @staticmethod
+    def _migrate_position_extra_columns(conn: sqlite3.Connection) -> None:
+        """为历史 `positions` 表补齐可卖基线字段。"""
+        rows = conn.execute("PRAGMA table_info(positions)").fetchall()
+        existing = {str(row[1]).lower() for row in rows}
+        if "sellable_base_quantity" not in existing:
+            conn.execute("ALTER TABLE positions ADD COLUMN sellable_base_quantity INTEGER DEFAULT 0")
+            conn.execute(
+                "UPDATE positions SET sellable_base_quantity = MIN(MAX(available_quantity, 0), MAX(total_quantity, 0)) "
+                "WHERE COALESCE(sellable_base_quantity, 0) = 0"
+            )
+
+    @staticmethod
     def _migrate_order_extra_columns(conn: sqlite3.Connection) -> None:
         """为历史 `orders` 表补齐 XtOrder 扩展字段。"""
         rows = conn.execute("PRAGMA table_info(orders)").fetchall()
@@ -1114,6 +1152,7 @@ class DataManager:
         required_columns = {
             "account_type": "INTEGER DEFAULT 0",
             "account_id": "TEXT DEFAULT ''",
+            "order_trace_id": "TEXT DEFAULT ''",
             "xt_stock_code": "TEXT DEFAULT ''",
             "xt_order_type": "INTEGER DEFAULT 0",
             "price_type": "INTEGER DEFAULT 0",
@@ -1134,6 +1173,57 @@ class DataManager:
         for name, ddl in required_columns.items():
             if name not in existing:
                 conn.execute(f"ALTER TABLE orders ADD COLUMN {name} {ddl}")
+
+    @staticmethod
+    def _migrate_legacy_order_timestamp_timezone(conn: sqlite3.Connection) -> None:
+        """把历史 `orders` 表中以 UTC 默认值保存的本地时间回填到东八区。"""
+
+        def _parse_sqlite_datetime(text_value: object) -> Optional[datetime]:
+            text = str(text_value or "").strip()
+            if not text:
+                return None
+            for candidate in (text, text.replace(" ", "T")):
+                try:
+                    return datetime.fromisoformat(candidate)
+                except ValueError:
+                    continue
+            return None
+
+        rows = conn.execute(
+            """
+            SELECT order_uuid, order_time, create_time, update_time
+            FROM orders
+            WHERE COALESCE(order_time, 0) > 0
+              AND COALESCE(create_time, '') <> ''
+            """
+        ).fetchall()
+        updated_rows = []
+        for row in rows:
+            order_dt = datetime.fromtimestamp(int(row[1] or 0))
+            create_dt = _parse_sqlite_datetime(row[2])
+            update_dt = _parse_sqlite_datetime(row[3])
+            if create_dt is None:
+                continue
+            delta_seconds = (order_dt - create_dt).total_seconds()
+            if not (7 * 3600 <= delta_seconds <= 9 * 3600):
+                continue
+
+            corrected_create_dt = create_dt + timedelta(hours=8)
+            corrected_update_dt = update_dt + timedelta(hours=8) if update_dt is not None else corrected_create_dt
+            updated_rows.append((
+                corrected_create_dt.isoformat(sep=" "),
+                corrected_update_dt.isoformat(sep=" "),
+                str(row[0]),
+            ))
+
+        if not updated_rows:
+            return
+
+        conn.executemany(
+            "UPDATE orders SET create_time = ?, update_time = ? WHERE order_uuid = ?",
+            updated_rows,
+        )
+        logger.info("DataManager: 已回填 %d 条历史订单时间到本地时区", len(updated_rows))
 
     @staticmethod
     def _to_yyyymmdd(value) -> str:

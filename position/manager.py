@@ -10,6 +10,7 @@ import threading
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
+from core.trading_calendar import is_market_day, minus_one_market_day
 from position.models import PositionInfo, FifoLot
 from trading.models import TradeRecord
 from config.enums import OrderDirection, CostMethod
@@ -217,11 +218,7 @@ class PositionManager:
             position.is_t0 = self._resolve_is_t0(position.stock_code, position)
             if self._cost_method == CostMethod.FIFO and position.total_quantity > 0 and not position.fifo_lots:
                 position.fifo_lots = [FifoLot(quantity=position.total_quantity, cost_price=position.avg_cost)]
-            # available_quantity 恢复为 total_quantity，表示恢复时默认全部可卖；
-            # 若未来需要严格恢复 T+1 冻结细节，可在快照中继续扩展该状态。
-            restored_available = int(position.available_quantity or 0)
-            restored_total = int(position.total_quantity or 0)
-            position.available_quantity = min(max(0, restored_available), restored_total)
+            self.normalize_restored_position(position)
             position.total_commission = position.total_fees or position.total_commission
             if position.total_cost <= 0 and position.avg_cost > 0 and position.total_quantity > 0:
                 position.total_cost = position.avg_cost * position.total_quantity
@@ -250,8 +247,9 @@ class PositionManager:
             for position in self._positions.values():
                 if position.total_quantity <= 0 or position.is_t0:
                     continue
-                if position.available_quantity == position.total_quantity:
+                if position.sellable_base_quantity == position.total_quantity and position.available_quantity == position.total_quantity:
                     continue
+                position.sellable_base_quantity = position.total_quantity
                 position.available_quantity = position.total_quantity
                 position.update_time = datetime.now()
                 unlocked += 1
@@ -278,13 +276,70 @@ class PositionManager:
             position = self._positions.get(strategy_id)
             if not position:
                 return False
-            clamped_available = min(max(0, int(available_quantity or 0)), int(position.total_quantity or 0))
+            sellable_base = min(
+                max(0, int(getattr(position, "sellable_base_quantity", 0) or 0)),
+                int(position.total_quantity or 0),
+            )
+            clamped_available = min(max(0, int(available_quantity or 0)), sellable_base)
             if position.available_quantity == clamped_available:
                 return False
             position.available_quantity = clamped_available
             position.update_time = datetime.now()
             self._persist_position(position)
             return True
+
+    @staticmethod
+    def _current_effective_trade_day(now: Optional[datetime] = None) -> str:
+        """返回当前应采用的交易日。"""
+        current = now or datetime.now()
+        candidate = current.strftime("%Y%m%d")
+        if is_market_day(candidate):
+            return candidate
+        try:
+            return minus_one_market_day(candidate)
+        except Exception:
+            return candidate
+
+    @staticmethod
+    def _resolve_position_source_trade_day(position: PositionInfo) -> str:
+        """从持仓更新时间推断该持仓所属交易日。"""
+        update_time = getattr(position, "update_time", None)
+        if not hasattr(update_time, "strftime"):
+            return ""
+        candidate = update_time.strftime("%Y%m%d")
+        if is_market_day(candidate):
+            return candidate
+        try:
+            return minus_one_market_day(candidate)
+        except Exception:
+            return ""
+
+    @classmethod
+    def normalize_restored_position(cls, position: PositionInfo, source_trade_day: str = "") -> PositionInfo:
+        """按当前交易日归一化恢复持仓的可用量。"""
+        restored_total = int(getattr(position, "total_quantity", 0) or 0)
+        restored_sellable_base = int(getattr(position, "sellable_base_quantity", 0) or 0)
+        restored_available = int(getattr(position, "available_quantity", 0) or 0)
+        inferred_sellable_base = max(restored_sellable_base, restored_available)
+        if bool(getattr(position, "is_t0", False)):
+            position.sellable_base_quantity = restored_total
+        else:
+            position.sellable_base_quantity = min(max(0, inferred_sellable_base), restored_total)
+        position.available_quantity = min(max(0, restored_available), position.sellable_base_quantity)
+
+        if restored_total <= 0 or bool(getattr(position, "is_t0", False)):
+            position.sellable_base_quantity = restored_total
+            position.available_quantity = min(max(0, position.available_quantity), restored_total)
+            return position
+
+        resolved_source_trade_day = str(source_trade_day or "").strip() or cls._resolve_position_source_trade_day(position)
+        if not resolved_source_trade_day:
+            return position
+
+        if resolved_source_trade_day != cls._current_effective_trade_day():
+            position.sellable_base_quantity = restored_total
+            position.available_quantity = restored_total
+        return position
 
     def _persist_position(self, position: PositionInfo) -> None:
         """把当前持仓快照同步到 SQLite。"""
@@ -326,6 +381,7 @@ class PositionManager:
             pos.total_quantity += qty
             if pos.is_t0:
                 # T+0 品种当日买入后即可回转，所以可用数量同步增加。
+                pos.sellable_base_quantity += qty
                 pos.available_quantity += qty
             pos.avg_cost = pos.total_cost / pos.total_quantity if pos.total_quantity > 0 else 0
         else:  # FIFO
@@ -335,9 +391,15 @@ class PositionManager:
             pos.total_cost += amount + total_fee
             pos.total_quantity += qty
             if pos.is_t0:
+                pos.sellable_base_quantity += qty
                 pos.available_quantity += qty
             # 即便用 FIFO，avg_cost 仍保留一个整体均价，便于界面展示与快速查看。
             pos.avg_cost = pos.total_cost / pos.total_quantity if pos.total_quantity > 0 else 0
+
+        if pos.is_t0:
+            pos.sellable_base_quantity = pos.total_quantity
+        else:
+            pos.sellable_base_quantity = min(max(0, pos.sellable_base_quantity), pos.total_quantity)
 
         pos.refresh_market_value(price)
 
@@ -362,6 +424,7 @@ class PositionManager:
             pos.realized_pnl += profit
             pos.total_cost -= cost_sold
             pos.total_quantity -= qty
+            pos.sellable_base_quantity = max(0, pos.sellable_base_quantity - qty)
             # 非 T+0 场景下，可用数量通常早已被交易系统冻结；这里统一按卖出数量回落本地可用值。
             pos.available_quantity = max(0, pos.available_quantity - qty)
             if pos.total_quantity <= 0:
@@ -369,6 +432,7 @@ class PositionManager:
                 pos.total_cost = 0
                 pos.avg_cost = 0
                 pos.total_quantity = 0
+                pos.sellable_base_quantity = 0
                 pos.available_quantity = 0
         else:  # FIFO
             # FIFO：从最早买入的批次开始逐批扣减，统计实际成本基础。
@@ -386,10 +450,15 @@ class PositionManager:
             profit = net_amount - cost_basis
             pos.realized_pnl += profit
             pos.total_quantity -= qty
+            pos.sellable_base_quantity = max(0, pos.sellable_base_quantity - qty)
             pos.available_quantity = max(0, pos.available_quantity - qty)
             # FIFO 下总成本由剩余 lot 重新汇总，而不是简单减一个平均成本。
             pos.total_cost = sum(l.quantity * l.cost_price for l in pos.fifo_lots)
             pos.avg_cost = pos.total_cost / pos.total_quantity if pos.total_quantity > 0 else 0
+
+            if pos.total_quantity <= 0:
+                pos.sellable_base_quantity = 0
+                pos.available_quantity = 0
 
         if pos.total_quantity > 0:
             pos.refresh_market_value(price)

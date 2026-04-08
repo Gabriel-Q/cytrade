@@ -26,7 +26,10 @@
       <el-table-column label="成交时间" width="170">
         <template #default="scope">{{ normalizeTradeTime(scope.row) }}</template>
       </el-table-column>
-      <el-table-column prop="order_remark" label="备注" />
+      <el-table-column label="备注" min-width="180">
+        <template #default="{ row }">{{ row.remark || '-' }}</template>
+      </el-table-column>
+      <el-table-column prop="order_trace_id" label="跟踪ID" width="170" />
     </el-table>
   </div>
 </template>

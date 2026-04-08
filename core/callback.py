@@ -160,13 +160,29 @@ class MyXtQuantTraderCallback(XtQuantTraderCallback):
                 return
             xt_id = int(getattr(order_error, "order_id", 0) or 0)
             err_msg = str(getattr(order_error, "error_msg", "unknown") or "unknown")
+            trace_id = str(getattr(order_error, "order_remark", "") or "").strip()
             logger.error("[Callback] 下单失败 order_id=%s msg=%s", xt_id, err_msg)
+            if xt_id <= 0 and trace_id:
+                local_order = self._order_mgr.get_order_by_trace_id(trace_id)
+                if local_order:
+                    self._order_mgr.mark_order_status(
+                        local_order.order_uuid,
+                        OrderStatus.JUNK,
+                        status_msg=err_msg,
+                        order_info={
+                            "status_msg": err_msg,
+                            "order_status": 57,
+                            "order_remark": trace_id,
+                        },
+                    )
+                    return
             self._order_mgr.update_order_status(
                 xt_order_id=xt_id,
                 status=OrderStatus.JUNK,
                 order_info={
                     "status_msg": err_msg,
                     "order_status": 57,
+                    "order_remark": trace_id,
                 },
             )
         except Exception as e:
@@ -175,9 +191,24 @@ class MyXtQuantTraderCallback(XtQuantTraderCallback):
     def on_cancel_error(self, cancel_error) -> None:
         """撤单错误。"""
         try:
+            if not self._order_mgr:
+                return
             xt_id = int(getattr(cancel_error, "order_id", 0) or 0)
             err_msg = str(getattr(cancel_error, "error_msg", "unknown") or "unknown")
+            trace_id = str(getattr(cancel_error, "order_remark", "") or "").strip()
             logger.warning("[Callback] 撤单失败 order_id=%s msg=%s", xt_id, err_msg)
+            local_order = None
+            if xt_id > 0:
+                local_order = self._order_mgr.get_order_by_xt_id(xt_id)
+            if not local_order and trace_id:
+                local_order = self._order_mgr.get_order_by_trace_id(trace_id)
+            if local_order:
+                self._order_mgr.mark_order_status(
+                    local_order.order_uuid,
+                    local_order.status,
+                    status_msg=f"撤单失败: {err_msg}",
+                    order_info={"status_msg": err_msg, "order_remark": trace_id},
+                )
         except Exception as e:
             logger.error("[Callback] on_cancel_error 异常: %s", e, exc_info=True)
 

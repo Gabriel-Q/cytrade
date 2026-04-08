@@ -259,7 +259,11 @@ class TradeExecutor:
             logger.warning("cancel_order [MOCK]: uuid=%s xt_id=%d",
                            order_uuid[:8], order.xt_order_id)
             # mock 模式下没有真实撤单回报，这里直接把内部状态切到已撤，便于上层流程继续。
-            order.status = OrderStatus.CANCELED
+            self._order_mgr.mark_order_status(
+                order_uuid,
+                OrderStatus.CANCELED,
+                status_msg=remark or "mock cancel",
+            )
             return True
 
         try:
@@ -322,14 +326,22 @@ class TradeExecutor:
                 price_type,
                 order.price,
                 order.strategy_name,
-                order.remark[:64],
+                order.order_trace_id,
             )
             order.status = OrderStatus.WAIT_REPORTING
             self._order_mgr.register_order(order)
             self._order_mgr.register_seq(seq, order.order_uuid)
-            logger.info("[ORDER] 下单提交 uuid=%s seq=%d code=%s dir=%s price=%.3f qty=%d",
-                        order.order_uuid[:8], seq, order.stock_code,
-                        order.direction.value, order.price, order.quantity)
+            logger.info(
+                "[ORDER] 下单提交 uuid=%s trace=%s seq=%d code=%s dir=%s price=%.3f qty=%d remark=%s",
+                order.order_uuid[:8],
+                order.order_trace_id,
+                seq,
+                order.stock_code,
+                order.direction.value,
+                order.price,
+                order.quantity,
+                order.remark,
+            )
         except Exception as e:
             order.status = OrderStatus.JUNK
             order.status_msg = str(e or "")

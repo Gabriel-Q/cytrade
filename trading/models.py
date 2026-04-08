@@ -16,6 +16,13 @@ import uuid
 from config.enums import OrderDirection, OrderType, OrderStatus
 
 
+def generate_order_trace_id() -> str:
+    """生成适合塞进 xt `order_remark` 的 23 位跟踪标识。"""
+    # 保留完整 order_uuid 作为系统主键；这里单独生成一个 23 位短标识，
+    # 用于穿过 xt 接口后在回调/主动同步里反查本地订单。
+    return uuid.uuid4().hex[:23]
+
+
 @dataclass
 class Order:
     """订单数据模型。
@@ -27,6 +34,7 @@ class Order:
     它会随着回报不断更新，因此是一个会变化的对象。
     """
     order_uuid: str = field(default_factory=lambda: str(uuid.uuid4()))  # 框架内部订单唯一标识。
+    order_trace_id: str = field(default_factory=generate_order_trace_id)  # 23 位柜台回查标识。
     strategy_id: str = ""  # 发起该委托的策略实例 ID。
     strategy_name: str = ""  # 发起该委托的策略名称。
     stock_code: str = ""  # 统一格式的 6 位证券代码。
@@ -106,11 +114,13 @@ class TradeRecord:
     trade_id: str = ""  # 交易所返回的成交编号。
     xt_traded_time: int = 0  # xtquant 原始成交时间。
     order_uuid: str = ""  # 关联的内部订单 UUID。
+    order_trace_id: str = ""  # 关联的 23 位柜台回查标识。
     xt_order_id: int = 0  # 关联的柜台订单号。
     order_sysid: str = ""  # 柜台合同编号。
     strategy_id: str = ""  # 归属策略实例 ID。
     strategy_name: str = ""  # 归属策略名称。
-    order_remark: str = ""  # 继承自委托的备注信息。
+    order_remark: str = ""  # 柜台原始委托备注（这里用于回查标识）。
+    remark: str = ""  # 业务备注/下单原因，供前端展示。
     stock_code: str = ""  # 统一格式股票代码。
     direction: OrderDirection = OrderDirection.BUY  # 买卖方向。
     xt_direction: int = 0  # xtquant 原始方向字段。
@@ -130,4 +140,4 @@ class TradeRecord:
     trade_time: datetime = field(default_factory=datetime.now)  # 框架记录的成交时间。
 
 
-__all__ = ["Order", "TradeRecord"]
+__all__ = ["Order", "TradeRecord", "generate_order_trace_id"]
